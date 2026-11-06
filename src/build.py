@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
 _C99_FLAGS = ("-std=c99", "-pedantic", "-Wall", "-Wextra", "-Werror", "-c")
@@ -18,6 +18,10 @@ _COMPILER_TIMEOUT_SECONDS = 120
 
 class C99ToolchainError(RuntimeError):
     """Raised when no usable C99 compiler command can be found or started."""
+
+
+class C99LinkConfigurationError(ValueError):
+    """Raised when explicit native-library inputs do not match FFI declarations."""
 
 
 @dataclass(frozen=True)
@@ -148,10 +152,27 @@ def link_c99_executable(
     output_path: str | os.PathLike[str],
     *,
     compiler: str | os.PathLike[str] | Sequence[str] | None = None,
+    libraries: Mapping[str, str | os.PathLike[str]] | None = None,
 ) -> Path:
-    """Compile and link one C99 translation unit as a host executable."""
+    """Compile and link C99 with explicitly named native-library files."""
     command_prefix = _resolve_compiler(compiler)
+    library_paths: list[Path] = []
+    for name, library_path in sorted((libraries or {}).items()):
+        if not name or Path(name).name != name:
+            raise C99LinkConfigurationError(
+                f"Invalid @link library name {name!r}"
+            )
+        path = Path(library_path).expanduser().resolve()
+        if not path.is_file():
+            raise C99LinkConfigurationError(
+                f"Library {name!r} does not resolve to a file: {path}"
+            )
+        library_paths.append(path)
     output = Path(output_path).expanduser().resolve()
+    if output in library_paths:
+        raise C99LinkConfigurationError(
+            "Executable output path cannot overwrite an input library"
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(
@@ -168,6 +189,7 @@ def link_c99_executable(
             *command_prefix,
             *_C99_LINK_FLAGS,
             str(source_file),
+            *(str(path) for path in library_paths),
             "-o",
             str(temporary_executable),
         )

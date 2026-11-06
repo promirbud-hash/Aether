@@ -86,6 +86,15 @@ The stable Python entry points are `compile_source` and `run_source` in
 `src.api`; compilation fails with diagnostics rather than executing an invalid
 module. The reference interpreter validates function-boundary primitive,
 struct, tensor, and `Result` payloads for the supported subset.
+For multi-file projects, `compile_project(entry_path)` loads relative `.hl`
+imports and returns a combined typed IR; `run_project(entry_path, function_name,
+...)` runs an entry-module function. `emit_c99_project`,
+`build_project_object`, and `build_project_executable` provide the supported
+Safe-C99 build path for projects. Imports use qualified names (`alias::function`
+and `alias::Type`) and reject cycles. Workspace/LSP import resolution is not
+yet supported. Import paths resolve from the importing file and must remain
+inside the entry file's directory; the same module may be imported through
+multiple distinct aliases.
 Unit conversions are explicit (`convert(value, "m")`) and are represented as
 rational scale/offset operations (plus a symbolic pi power for angular units)
 in semantic results and executed by the reference interpreter. Its typed IR
@@ -117,6 +126,7 @@ The experimental Safe-C99 backend is available as `emit_c99(source)` from
 unsupported features with diagnostics. `build_object(source, output_path)`
 compiles that subset to a host object file. `build_executable(source,
 output_path)` links a program whose entry point is `fn main() -> i32` or
-`fn main() -> void`. Neither API loads libraries or runs generated programs.
-See `docs/aether-subset.md` for the supported operations and arithmetic
-failure behavior.
+`fn main() -> void`. Native C ABI calls require explicit `libraries` mappings
+from each `@link` name to a linker-compatible file. The build APIs do not
+dynamically load libraries or run generated programs. See
+`docs/aether-subset.md` for the supported operations and limitations.

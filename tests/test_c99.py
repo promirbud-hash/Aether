@@ -15,6 +15,7 @@ from src.api import (
 )
 from src.build import (
     C99BuildError,
+    C99LinkConfigurationError,
     C99ToolchainError,
     compile_c99_object,
 )
@@ -25,6 +26,20 @@ _STRICT_C99_FLAGS = ("-std=c99", "-pedantic", "-Wall", "-Wextra", "-Werror")
 
 class C99BackendTests(unittest.TestCase):
     def compiler(self) -> tuple[str, ...]:
+        configured_compiler = os.environ.get("AETHER_C99_COMPILER")
+        if configured_compiler:
+            path = shutil.which(configured_compiler)
+            if path is not None:
+                if Path(path).stem.lower() == "zig":
+                    return (path, "cc")
+                return (path,)
+            message = (
+                f"Configured C99 compiler {configured_compiler!r} is not installed"
+            )
+            if os.environ.get("AETHER_REQUIRE_C99_COMPILER") == "1":
+                self.fail(message)
+            self.skipTest(message)
+
         compiler = next(
             (
                 (path,)
@@ -143,6 +158,31 @@ class C99BackendTests(unittest.TestCase):
             self.assertTrue(actual_path.is_file())
             self.assertGreater(actual_path.stat().st_size, 0)
 
+    def test_build_object_compiles_supported_c_abi_scalar_prototypes(self) -> None:
+        compiler = self.compiler()
+        source = "\n".join(
+            f'@ffi @link("native") extern "C" fn ffi_{type_name}(value: {type_name}) -> {result};'
+            for type_name, result in (
+                ("i8", "i8"),
+                ("i16", "i16"),
+                ("i32", "i32"),
+                ("i64", "i64"),
+                ("u8", "u8"),
+                ("u16", "u16"),
+                ("u32", "u32"),
+                ("u64", "u64"),
+                ("f32", "f32"),
+                ("f64", "f64"),
+            )
+        ) + '\n@ffi @link("native") extern "C" fn ffi_void(value: i32) -> void;\n'
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = build_object(
+                source,
+                Path(temporary_directory) / "ffi-prototypes.o",
+                compiler=compiler,
+            )
+            self.assertTrue(output.is_file())
+
     def test_build_object_preserves_artifact_on_compiler_failure(self) -> None:
         compiler = self.compiler()
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -203,6 +243,197 @@ class C99BackendTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0)
+
+    def test_build_executable_links_real_c_abi_library(self) -> None:
+        compiler = self.compiler()
+        source = (
+            '@ffi\n@link("sensor")\n'
+            'extern "C" fn read_channel(channel: i32) -> i32;\n'
+            "@ffi\n"
+            "fn main() -> i32 { return read_channel(19); }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_object = Path(temporary_directory) / "sensor.o"
+            compile_c99_object(
+                "#include <stdint.h>\n"
+                "int32_t read_channel(int32_t channel) {\n"
+                "    return channel + 7;\n"
+                "}\n",
+                library_object,
+                compiler=compiler,
+            )
+            executable = build_executable(
+                source,
+                Path(temporary_directory) / "aether-program.exe",
+                compiler=compiler,
+                libraries={"sensor": library_object},
+            )
+            result = subprocess.run(
+                [str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 26, result.stderr)
+
+    def test_build_executable_roundtrips_all_supported_scalar_ffi_types(self) -> None:
+        compiler = self.compiler()
+        signatures = (
+            ("i8", "i8"),
+            ("i16", "i16"),
+            ("i32", "i32"),
+            ("i64", "i64"),
+            ("u8", "u8"),
+            ("u16", "u16"),
+            ("u32", "u32"),
+            ("u64", "u64"),
+            ("f32", "f32"),
+            ("f64", "f64"),
+        )
+        declarations = "\n".join(
+            declaration
+            for name, type_name in signatures
+            for declaration in (
+                f'@ffi @link("native") extern "C" fn get_{name}() -> {type_name};',
+                f'@ffi @link("native") extern "C" fn check_{name}(value: {type_name}) -> i32;',
+            )
+        )
+        source = (
+            declarations
+            + '\n@ffi @link("native") extern "C" fn mark_void() -> void;\n'
+            + '@ffi @link("native") extern "C" fn check_void() -> i32;\n'
+            + "@ffi fn main() -> i32 {\n"
+            + "    mark_void();\n"
+            + "    return "
+            + " + ".join(
+                f"check_{name}(get_{name}())" for name, _ in signatures
+            )
+            + " + check_void();\n}\n"
+        )
+        c_functions = (
+            "#include <stdint.h>\n"
+            "#include <stdbool.h>\n"
+            "int8_t get_i8(void) { return INT8_C(-101); }\n"
+            "int32_t check_i8(int8_t value) { return value == INT8_C(-101) ? 0 : 1; }\n"
+            "int16_t get_i16(void) { return INT16_C(-30001); }\n"
+            "int32_t check_i16(int16_t value) { return value == INT16_C(-30001) ? 0 : 1; }\n"
+            "int32_t get_i32(void) { return INT32_C(-2000000001); }\n"
+            "int32_t check_i32(int32_t value) { return value == INT32_C(-2000000001) ? 0 : 1; }\n"
+            "int64_t get_i64(void) { return INT64_C(-9000000000000000001); }\n"
+            "int32_t check_i64(int64_t value) { return value == INT64_C(-9000000000000000001) ? 0 : 1; }\n"
+            "uint8_t get_u8(void) { return UINT8_C(250); }\n"
+            "int32_t check_u8(uint8_t value) { return value == UINT8_C(250) ? 0 : 1; }\n"
+            "uint16_t get_u16(void) { return UINT16_C(65000); }\n"
+            "int32_t check_u16(uint16_t value) { return value == UINT16_C(65000) ? 0 : 1; }\n"
+            "uint32_t get_u32(void) { return UINT32_C(4000000000); }\n"
+            "int32_t check_u32(uint32_t value) { return value == UINT32_C(4000000000) ? 0 : 1; }\n"
+            "uint64_t get_u64(void) { return UINT64_C(18000000000000000000); }\n"
+            "int32_t check_u64(uint64_t value) { return value == UINT64_C(18000000000000000000) ? 0 : 1; }\n"
+            "float get_f32(void) { return 1.25f; }\n"
+            "int32_t check_f32(float value) { return value == 1.25f ? 0 : 1; }\n"
+            "double get_f64(void) { return 2.5; }\n"
+            "int32_t check_f64(double value) { return value == 2.5 ? 0 : 1; }\n"
+            "static int void_called;\n"
+            "void mark_void(void) { void_called = 1; }\n"
+            "int32_t check_void(void) { return void_called ? 0 : 1; }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_object = Path(temporary_directory) / "native.o"
+            compile_c99_object(
+                c_functions,
+                library_object,
+                compiler=compiler,
+            )
+            executable = build_executable(
+                source,
+                Path(temporary_directory) / "aether-program.exe",
+                compiler=compiler,
+                libraries={"native": library_object},
+            )
+            result = subprocess.run(
+                [str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_build_executable_requires_exact_explicit_library_mapping(self) -> None:
+        source = (
+            '@ffi\n@link("sensor")\n'
+            'extern "C" fn read_channel(channel: i32) -> i32;\n'
+            "@ffi\n"
+            "fn main() -> i32 { return read_channel(1); }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with self.assertRaises(C99LinkConfigurationError):
+                build_executable(
+                    source,
+                    Path(temporary_directory) / "program",
+                    compiler=("aether-missing-c-compiler",),
+                )
+            with self.assertRaises(C99LinkConfigurationError):
+                build_executable(
+                    "fn main() -> i32 { return 0; }\n",
+                    Path(temporary_directory) / "program",
+                    compiler=("aether-missing-c-compiler",),
+                    libraries={"unused": "unused.o"},
+                )
+
+    def test_build_executable_rejects_output_that_would_overwrite_library(self) -> None:
+        compiler = self.compiler()
+        source = (
+            '@ffi @link("sensor") extern "C" fn read_value() -> i32;\n'
+            "@ffi fn main() -> i32 { return read_value(); }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_object = Path(temporary_directory) / "sensor.o"
+            compile_c99_object(
+                "int read_value(void) { return 1; }\n",
+                library_object,
+                compiler=compiler,
+            )
+            with self.assertRaises(C99LinkConfigurationError):
+                build_executable(
+                    source,
+                    library_object,
+                    compiler=compiler,
+                    libraries={"sensor": library_object},
+                )
+
+    def test_build_executable_preserves_previous_artifact_on_link_error(self) -> None:
+        compiler = self.compiler()
+        source = (
+            '@ffi\n@link("sensor")\n'
+            'extern "C" fn missing_symbol(channel: i32) -> i32;\n'
+            "@ffi\n"
+            "fn main() -> i32 { return missing_symbol(1); }\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_object = Path(temporary_directory) / "sensor.o"
+            compile_c99_object(
+                "#include <stdint.h>\n"
+                "int32_t other_symbol(uint32_t channel) { return (int32_t)channel; }\n",
+                library_object,
+                compiler=compiler,
+            )
+            executable_path = Path(temporary_directory) / "existing.exe"
+            executable_path.write_bytes(b"previous executable")
+            with self.assertRaises(C99BuildError):
+                build_executable(
+                    source,
+                    executable_path,
+                    compiler=compiler,
+                    libraries={"sensor": library_object},
+                )
+            self.assertEqual(
+                executable_path.read_bytes(),
+                b"previous executable",
+            )
 
     def test_build_executable_rejects_missing_or_invalid_entry_point(self) -> None:
         cases = (
@@ -473,8 +704,8 @@ int main(int argc, char **argv) {
                 "E_C99_EFFECT",
             ),
             (
-                "@ffi @link(\"sensor\") extern \"C\" fn read() -> i32;\n",
-                "E_C99_FFI",
+                '@ffi\n@link("sensor")\nextern "C" fn café() -> i32;\n',
+                "E_C99_FFI_SYMBOL",
             ),
             (
                 "fn missing_return(value: i32) -> i32 { let copy = value; }\n",

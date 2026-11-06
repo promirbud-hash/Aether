@@ -56,7 +56,8 @@ for prototyping and testing, not a sandbox or production runtime.
 ## Grammar (informal EBNF)
 
 ```ebnf
-module       = { attribute* declaration } ;
+module       = { import | attribute* declaration } ;
+import       = "import" string "as" identifier ";" ;
 declaration  = function | extern_function | type_decl ;
 attribute    = "@" identifier [ "(" [ expression_list ] ")" ] ;
 function     = ("fn" | "func") identifier "(" [ parameters ] ")"
@@ -67,7 +68,8 @@ parameters   = parameter { "," parameter } [ "," ] ;
 parameter    = identifier ":" type ;
 type_decl    = ("type" | "struct") identifier "{" { field [ "," ] } "}" ;
 field        = identifier ":" type ;
-type         = identifier [ "<" type { "," type } ">" ]
+type         = [ identifier "::" ] identifier
+               [ "<" type { "," type } ">" ]
              | "[" [ integer { "," integer } ] "]" ;
 block        = "{" { statement [ ";" ] } "}" ;
 statement    = ("let" | "var" | "const") identifier [ ":" type ]
@@ -78,13 +80,50 @@ expression   = prefix { postfix | infix expression } ;
 prefix       = literal | identifier | "(" expression ")" | unary expression
              | match_expression ;
 postfix      = "(" [ expression_list ] ")" | "." identifier
-             | "?." identifier | "[" expression "]" | "?" ;
+             | "?." identifier | "[" expression "]" | "?"
+             | "::" identifier ;
 match_expression = "match" expression "{"
                    result_arm "," result_arm [ "," ] "}" ;
 result_arm   = ("Ok" | "Err") "(" ( identifier | "_" ) ")" "=>" expression ;
 infix        = "|>" | "??" | "||" | "&&" | comparison
              | "+" | "-" | "*" | "/" | "%" | "**" ;
 ```
+
+## Multi-file projects v0
+
+Projects can be compiled with `compile_project(entry_path)` and run with
+`run_project(entry_path, function_name, *arguments)`. Imports use a quoted
+relative `.hl` path, resolved from the file containing the import:
+
+```aether
+import "math/vector.hl" as vector;
+
+fn main(value: i32) -> i32 {
+    return vector::double(value);
+}
+```
+
+The entry file's containing directory is the project root. Import paths may use
+`.` and `..` as long as their resolved targets remain inside that root; absolute
+paths, paths that escape the root, non-`.hl` paths, and paths containing control
+characters are rejected. Re-importing one file through different aliases is
+allowed and loads the module only once.
+
+Imported functions and custom types must be referenced through their alias
+using `alias::name`; unqualified imports, wildcard imports, and re-exports are
+not supported. All declarations in an imported file are currently visible to
+its importer through that alias. An alias may have the same name as a local
+function because qualified and unqualified names are distinct. Duplicate aliases
+within one module, import cycles, missing files, and unknown aliases or symbols
+produce diagnostics with the originating file and source location.
+`compile_source` remains the single-file API and reports an error if imports or
+qualified names are used there.
+
+Project compilation combines modules for semantic analysis, the reference
+interpreter, and the supported C99 subset. Imported native `extern "C"`
+declarations are rejected; native declarations in the entry module can still
+use the explicit `@link` mapping described below. Workspace/LSP import
+resolution is not part of this version.
 
 Infix precedence from lowest to highest is `|>`, `??`, `||`, `&&`,
 comparisons, `+ -`, `* / %`, and `**`. `**` is right-associative; the other
@@ -149,9 +188,9 @@ on a function is an `E_EFFECT_VIOLATION`. An unused effect annotation does not
 itself force callers to declare that effect. Built-in operation names are
 reserved for these signatures.
 
-## Foreign function interface v0
+## Foreign function interface v1
 
-The prototype accepts explicit declarations for scalar functions exposed
+The compiler accepts explicit declarations for scalar functions exposed
 through the C ABI:
 
 ```aether
@@ -175,26 +214,36 @@ linker name, not a path.
 
 The `@ffi` effect is required by each extern declaration and propagates to
 callers, which must also declare `@ffi`. It may also be used on an ordinary
-function as an effect annotation. The IR retains the symbol, ABI, library,
-signature, and effect metadata.
+function as an effect annotation. An extern function's Aether name is also its
+C linker symbol; the backend rejects names that are not portable C
+identifiers. The IR retains the symbol, ABI, library, signature, and effect
+metadata.
 
-This is declaration and semantic support only: the prototype does not search
-for libraries, load native code, generate C prototypes, invoke a system
-linker, or define native error/ownership behavior. In the reference
-interpreter, tests may provide an explicit `external_handlers` mapping keyed
-by Aether symbol name. Arguments and scalar results are checked against the
-declared types; a missing handler raises `AetherRuntimeError`. This lets tests
-exercise call boundaries without executing any native code. C++, Rust, and
-other-language libraries must expose a compatible C ABI through their own
-wrapper; Python embedding is a separate, optional runtime integration and is
-not part of this FFI.
+The C99 backend emits matching C prototypes and direct calls for supported
+extern declarations. `build_executable` requires an explicit mapping from each
+`@link` name to a linker-compatible object or library file, for example
+`libraries={"sensor": "build/sensor.o"}`. No library is searched for or
+downloaded implicitly; paths are passed directly to the compiler driver
+without a shell. Linking errors are reported and do not replace an existing
+output executable. This stage does not load libraries dynamically and does
+not define native ownership or error conventions.
+
+The reference interpreter remains independent of native code: tests may
+provide an explicit `external_handlers` mapping keyed by Aether symbol name.
+Arguments and scalar results are checked against the declared types; a
+missing handler raises `AetherRuntimeError`. C++, Rust, and other-language
+libraries must expose a compatible C ABI through their own wrapper. Python
+embedding is a separate, optional runtime integration and is not part of this
+FFI.
 
 ## Safe-C99 backend v0
 
 `emit_c99(source)` in `src.api` emits deterministic C99 for a deliberately
-small scalar subset. It accepts pure functions with explicit scalar return
-types, scalar parameters and locals, literals, user-function calls, pipelines
-to user functions, boolean logic, comparisons, and basic arithmetic. Generated
+small scalar subset. `emit_c99_project(entry_path)` does the same for a
+multi-file project after resolving imports. Both accept functions with explicit
+scalar return types, scalar parameters and locals, literals, user-function
+calls, pipelines to user functions, scalar C ABI declarations and calls,
+boolean logic, comparisons, and basic arithmetic. Generated
 function and local identifiers use a stable UTF-8-hex encoding with the
 `aether_fn_` and `aether_v_` prefixes. This avoids C keyword collisions; the
 output is a translation unit, not an executable and has no generated `main`.
@@ -214,10 +263,9 @@ implementation.
 
 The backend reports `CompilationError` diagnostics for unsupported constructs
 instead of silently emitting a substitute. Tensors, units, structs, strings,
-`Result`, exponentiation, built-in operations, effects, and extern/FFI
-declarations are not supported. It does not invoke a C compiler or linker,
-load libraries, or provide a runtime ABI. In particular, native FFI lowering
-is a future step, separate from the existing declaration-only FFI v0.
+`Result`, exponentiation, built-in operations, effects other than `@ffi`, and
+non-C extern declarations are not supported. The emitter itself does not
+invoke a C compiler or linker or dynamically load libraries.
 Integer boundary checks and invalid-operation traps are exercised by compiled
 harnesses. The interpreter uses Python integers and therefore does not trap on
 fixed-width overflow; compare only in-range reference executions. Locally,
@@ -235,16 +283,29 @@ may select a compiler explicitly, including a command sequence such as
 `("zig", "cc")`. Compiler arguments are passed without a shell. The driver
 uses strict C99 warnings-as-errors and compile-only mode, captures diagnostics,
 and replaces the requested output atomically only after successful compilation.
-It does not select a cross-compilation target or load FFI libraries.
+It does not select a cross-compilation target or resolve FFI symbols; unresolved
+symbols may remain in the object for a later link step.
 
-`build_executable(source, output_path, compiler=None)` compiles and links a
-host executable. Executable source must define an effect-free `fn main() -> i32`
-or `fn main() -> void` with no parameters. The backend adds the standard C
-`int main(void)` wrapper; an Aether `i32` result becomes the process exit code,
-while a `void` result becomes exit code zero. This initial linker accepts no
-extra libraries or linker options and does not load FFI declarations. It does
-not execute the resulting program. The host compiler and its target ABI define
-the executable format.
+`build_executable(source, output_path, compiler=None, libraries=None)` compiles
+and links a host executable. Executable source must define `fn main() -> i32`
+or `fn main() -> void` with no parameters; the function may declare `@ffi` when
+it calls native functions. The backend adds the standard C `int main(void)`
+wrapper; an Aether `i32` result becomes the process exit code, while a `void`
+result becomes exit code zero. Each `@link` name must have exactly one explicit
+entry in `libraries`, mapping it to an existing linker-compatible file. No
+libraries or linker options are inferred or fetched. The output is replaced
+only after successful linking, and the API does not execute the program. The
+host compiler and its target ABI define the executable format.
+
+`build_project_object(entry_path, output_path, compiler=None)` and
+`build_project_executable(entry_path, output_path, compiler=None,
+libraries=None)` provide the corresponding object and executable build paths
+for projects. The root module must define `main` for an executable. Imported
+function names are encoded deterministically into internal C identifiers;
+calls across module boundaries compile into the same translation unit.
+Imported C ABI declarations are currently rejected rather than silently
+omitted. In the entry module, FFI libraries still require the exact explicit
+mapping for every declared `@link`.
 
 ## Result handling v0.2
 

@@ -7,8 +7,13 @@ on:
 jobs:
   python-and-c99:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
     env:
       AETHER_REQUIRE_C99_COMPILER: "1"
+      AETHER_C99_COMPILER: ${{ matrix.compiler }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,7 +21,9 @@ jobs:
           python-version: "3.13"
       - name: Install Python dependencies
         run: python -m pip install -r requirements.txt
-      - name: Verify C compiler
-        run: cc --version
+      - name: Install selected C compiler
+        run: sudo apt-get update && sudo apt-get install --yes "$AETHER_C99_COMPILER"
+      - name: Verify selected C compiler
+        run: "$AETHER_C99_COMPILER" --version
       - name: Run test suite with required C99 compiler
         run: python -m unittest discover -s tests -v

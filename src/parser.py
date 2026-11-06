@@ -16,6 +16,8 @@ _KEYWORDS = {
     "var",
     "const",
     "return",
+    "import",
+    "as",
     "if",
     "else",
     "for",

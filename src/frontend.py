@@ -58,6 +58,7 @@ _UNIT_NAMES = {
 _CST_KINDS = {
     "FunctionDecl": "function_declaration",
     "TypeDecl": "type_declaration",
+    "ImportDecl": "import_declaration",
 }
 
 
@@ -67,6 +68,7 @@ class SourceSpan:
     end: int
     line: int
     column: int
+    source_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,7 @@ class TypeExpr:
     arguments: tuple[TypeExpr, ...]
     dimensions: tuple[str, ...]
     span: SourceSpan
+    qualifier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,12 +170,20 @@ class TypeDecl:
     span: SourceSpan
 
 
+@dataclass(frozen=True)
+class ImportDecl:
+    path: str
+    alias: str
+    span: SourceSpan
+
+
 Declaration = FunctionDecl | TypeDecl
 
 
 @dataclass(frozen=True)
 class Module:
     declarations: tuple[Declaration, ...]
+    imports: tuple[ImportDecl, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -190,8 +201,9 @@ class _SyntaxError(Exception):
 
 
 class _FrontendParser:
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, source_path: str | None = None) -> None:
         self.source = source
+        self.source_path = source_path
         all_tokens = tokenize(source)
         self.tokens = [token for token in all_tokens if token.kind not in _TRIVIA]
         try:
@@ -240,7 +252,13 @@ class _FrontendParser:
     def span(self, start: int, end: int) -> SourceSpan:
         line = self.source.count("\n", 0, start) + 1
         last_newline = self.source.rfind("\n", 0, start)
-        return SourceSpan(start, end, line, start - last_newline)
+        return SourceSpan(
+            start,
+            end,
+            line,
+            start - last_newline,
+            self.source_path,
+        )
 
     def diagnose(self, code: str, message: str, token: Token) -> None:
         self.diagnostics.append(
@@ -249,10 +267,19 @@ class _FrontendParser:
 
     def parse(self) -> Module:
         declarations: list[Declaration] = []
+        imports: list[ImportDecl] = []
         while self.current().kind != "EOF":
             start_position = self.position
             attributes: list[Attribute] = []
             try:
+                if self.current().value == "import":
+                    if attributes:
+                        raise _SyntaxError(
+                            "Imports cannot have declaration attributes",
+                            self.current(),
+                        )
+                    imports.append(self.parse_import())
+                    continue
                 while self.current().value == "@":
                     attributes.append(self.parse_attribute())
                 token = self.current()
@@ -284,14 +311,33 @@ class _FrontendParser:
                     declarations.append(self.parse_type_decl(tuple(attributes)))
                 else:
                     raise _SyntaxError(
-                        "Expected a function or type declaration", token
+                        "Expected an import, function, or type declaration", token
                     )
             except _SyntaxError as error:
                 self.diagnose("E_SYNTAX", error.message, error.token)
                 self.recover_declaration(start_position)
             if self.position == start_position:
                 self.advance()
-        return Module(tuple(declarations))
+        return Module(tuple(declarations), tuple(imports))
+
+    def parse_import(self) -> ImportDecl:
+        start = self.expect("import").start
+        path_token = self.current()
+        if path_token.kind != "STRING" or not path_token.value.startswith('"'):
+            raise _SyntaxError('Expected a quoted relative path after "import"', path_token)
+        self.advance()
+        try:
+            import ast as python_ast
+
+            path = python_ast.literal_eval(path_token.value)
+        except (SyntaxError, ValueError) as error:
+            raise _SyntaxError("Invalid import path string", path_token) from error
+        if not isinstance(path, str):
+            raise _SyntaxError("Import path must be a string", path_token)
+        self.expect("as", 'Expected "as" after import path')
+        alias = self.expect_identifier("Expected an import alias")
+        end = self.expect(";", "Expected ';' after import declaration").end
+        return ImportDecl(path, alias.value, self.span(start, end))
 
     def recover_declaration(self, start_position: int) -> None:
         if self.position == start_position and self.current().kind != "EOF":
@@ -307,7 +353,9 @@ class _FrontendParser:
                 if depth == 0:
                     return
                 continue
-            elif depth == 0 and token.value in {"fn", "func", "type", "struct", "@"}:
+            elif depth == 0 and token.value in {
+                "import", "fn", "func", "type", "struct", "@"
+            }:
                 return
             self.advance()
 
@@ -415,6 +463,10 @@ class _FrontendParser:
             return TypeExpr("[]", (), tuple(dimensions), self.span(start_token.start, end))
 
         name = self.expect_identifier("Expected a type name")
+        qualifier = None
+        if self.match("::"):
+            qualifier = name.value
+            name = self.expect_identifier("Expected a type name after '::'")
         arguments: list[TypeExpr] = []
         end = name.end
         if self.match("<"):
@@ -423,7 +475,13 @@ class _FrontendParser:
                 if not self.match(","):
                     break
             end = self.expect(">", "Expected '>' after type arguments").end
-        return TypeExpr(name.value, tuple(arguments), (), self.span(name.start, end))
+        return TypeExpr(
+            name.value,
+            tuple(arguments),
+            (),
+            self.span(start_token.start, end),
+            qualifier,
+        )
 
     def parse_block(self) -> tuple[tuple[Statement, ...], int]:
         self.expect("{", "Expected a function body")
@@ -487,6 +545,20 @@ class _FrontendParser:
                 continue
             if token.value == "(":
                 left = self.parse_call(left)
+                continue
+            if token.value == "::":
+                operator = self.advance()
+                member = self.expect_identifier("Expected a qualified symbol name")
+                if left.kind != "identifier":
+                    raise _SyntaxError(
+                        "A qualified name must start with an import alias",
+                        operator,
+                    )
+                left = Expr(
+                    "qualified",
+                    self.span(left.span.start, member.end),
+                    f"{left.value}::{member.value}",
+                )
                 continue
             if token.value in {".", "?."}:
                 operator = self.advance()
@@ -594,7 +666,11 @@ def _build_syntax_cst(source: str, ast: Module, lexical_cst: CSTNode) -> CSTNode
     nodes: list[CSTNode] = []
     children = lexical_cst.children
     cursor = 0
-    for declaration in ast.declarations:
+    top_level_nodes = sorted(
+        (*ast.imports, *ast.declarations),
+        key=lambda node: node.span.start,
+    )
+    for declaration in top_level_nodes:
         declaration_children = []
         while cursor < len(children) and children[cursor].end <= declaration.span.start:
             nodes.append(children[cursor])
@@ -620,6 +696,14 @@ def _build_syntax_cst(source: str, ast: Module, lexical_cst: CSTNode) -> CSTNode
 
 
 def _analyze(module: Module, parser: _FrontendParser) -> None:
+    for import_decl in module.imports:
+        parser.diagnostics.append(
+            Diagnostic(
+                "E_IMPORT_PROJECT_ONLY",
+                "Imports require compile_project() and cannot be used with compile_source()",
+                import_decl.span,
+            )
+        )
     declarations: dict[str, Declaration] = {}
     functions = {declaration.name for declaration in module.declarations if isinstance(declaration, FunctionDecl)}
     type_names = {declaration.name for declaration in module.declarations if isinstance(declaration, TypeDecl)}
@@ -773,8 +857,17 @@ def _analyze_type(
     declared_types: set[str],
     diagnostics: list[Diagnostic],
 ) -> None:
+    if type_expr.qualifier is not None:
+        diagnostics.append(
+            Diagnostic(
+                "E_IMPORT_PROJECT_ONLY",
+                "Qualified types require compile_project()",
+                type_expr.span,
+            )
+        )
     if (
         type_expr.name != "[]"
+        and type_expr.qualifier is None
         and type_expr.name not in _BUILTIN_TYPES
         and type_expr.name not in declared_types
         and type_expr.name not in _UNIT_NAMES
@@ -827,6 +920,15 @@ def _analyze_expression(
     if expression.kind == "member":
         _analyze_expression(expression.children[0], locals_, functions, diagnostics)
         return
+    if expression.kind == "qualified":
+        diagnostics.append(
+            Diagnostic(
+                "E_IMPORT_PROJECT_ONLY",
+                "Qualified names require compile_project()",
+                expression.span,
+            )
+        )
+        return
     for child in expression.children:
         _analyze_expression(child, locals_, functions, diagnostics)
     for arm in expression.arms:
@@ -837,15 +939,22 @@ def _analyze_expression(
 def _render_type(type_expr: TypeExpr) -> str:
     if type_expr.name == "[]":
         return "[" + ",".join(type_expr.dimensions) + "]"
+    name = (
+        f"{type_expr.qualifier}::{type_expr.name}"
+        if type_expr.qualifier
+        else type_expr.name
+    )
     if type_expr.arguments:
-        return f"{type_expr.name}<" + ",".join(
+        return f"{name}<" + ",".join(
             _render_type(argument) for argument in type_expr.arguments
         ) + ">"
-    return type_expr.name
+    return name
 
 
 def _render_expression(expression: Expr, parent_precedence: int = 0) -> str:
     if expression.kind in {"identifier", "literal"}:
+        return expression.value
+    if expression.kind == "qualified":
         return expression.value
     if expression.kind == "group":
         return "(" + _render_expression(expression.children[0]) + ")"
@@ -895,9 +1004,16 @@ def _render_expression(expression: Expr, parent_precedence: int = 0) -> str:
     raise ValueError(f"Unsupported expression kind {expression.kind!r}")
 
 
+def _escape_import_path(path: str) -> str:
+    return path.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def render_module(module: Module) -> str:
     """Render a canonical source form from the parsed AST (comments are omitted)."""
-    lines: list[str] = []
+    lines: list[str] = [
+        f'import "{_escape_import_path(import_decl.path)}" as {import_decl.alias};'
+        for import_decl in module.imports
+    ]
     for declaration in module.declarations:
         lines.extend(
             f"@{attribute.name}"
@@ -955,19 +1071,33 @@ def render_module(module: Module) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def parse_source(source: str) -> FrontendResult:
-    """Parse source into syntax-aware CST and AST, returning recoverable diagnostics."""
-    parser = _FrontendParser(source)
-    ast = parser.parse()
-    _analyze(ast, parser)
-    from src.semantic import analyze
+def validate_module(module: Module) -> tuple[Diagnostic, ...]:
+    """Run declaration and local-name validation on an already parsed module."""
+    parser = _FrontendParser("")
+    _analyze(module, parser)
+    return tuple(parser.diagnostics)
 
-    parser.diagnostics.extend(analyze(ast).diagnostics)
+
+def parse_source(
+    source: str,
+    *,
+    source_path: str | None = None,
+    validate: bool = True,
+) -> FrontendResult:
+    """Parse source into syntax-aware CST and AST, returning recoverable diagnostics."""
+    parser = _FrontendParser(source, source_path)
+    ast = parser.parse()
+    if validate:
+        parser.diagnostics.extend(validate_module(ast))
+        from src.semantic import analyze
+
+        parser.diagnostics.extend(analyze(ast).diagnostics)
     cst = _build_syntax_cst(source, ast, parser.lexical_cst)
     return FrontendResult(cst, ast, tuple(parser.diagnostics))
 
 
 def parse_source_file(path: str | Path, *, encoding: str = "utf-8") -> FrontendResult:
     """Read and parse a source file without newline normalization."""
-    with Path(path).open("r", encoding=encoding, newline="") as source_file:
-        return parse_source(source_file.read())
+    source_path = Path(path).resolve()
+    with source_path.open("r", encoding=encoding, newline="") as source_file:
+        return parse_source(source_file.read(), source_path=str(source_path))

@@ -46,6 +46,15 @@ _INTEGER_LIMITS = {
 _BINARY_OPERATORS = {
     "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
 }
+_C_KEYWORDS = {
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if",
+    "inline", "int", "long", "register", "restrict", "return", "short",
+    "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+    "unsigned", "void", "volatile", "while", "_Alignas", "_Alignof",
+    "_Atomic", "_Bool", "_Complex", "_Generic", "_Imaginary", "_Noreturn",
+    "_Static_assert", "_Thread_local",
+}
 
 
 class C99LoweringError(ValueError):
@@ -105,7 +114,11 @@ class _C99Emitter:
                 type_.name not in _C_TYPES
                 or (
                     type_.name == "void"
-                    and role not in {"return", "expression"}
+                    and role not in {
+                        "return",
+                        "expression",
+                        "FFI return",
+                    }
                 )
             )
             or _has_unit(type_)
@@ -275,11 +288,32 @@ class _C99Emitter:
             )
             return
         if target.external_abi is not None:
-            self.error(
-                "E_C99_FFI",
-                f"Native FFI call {name!r} is not supported by C99 v0",
-                span,
-            )
+            if target.external_abi != "C":
+                self.error(
+                    "E_C99_FFI",
+                    f"Foreign ABI {target.external_abi!r} is not supported",
+                    span,
+                )
+            if (
+                not target.name.isascii()
+                or not target.name.isidentifier()
+                or target.name.startswith("_")
+                or target.name in _C_KEYWORDS
+            ):
+                self.error(
+                    "E_C99_FFI_SYMBOL",
+                    f"Extern function name {target.name!r} is not a portable C symbol",
+                    span,
+                )
+            if target.external_library is None:
+                self.error(
+                    "E_C99_FFI_LIBRARY",
+                    f"Extern function {name!r} has no @link library",
+                    span,
+                )
+            for parameter in target.parameters:
+                self.validate_type(parameter.type, span, "FFI parameter")
+            self.validate_type(target.return_type, span, "FFI return")
         if len(argument_types) != len(target.parameters):
             return
         for actual, expected in zip(argument_types, target.parameters):
@@ -373,19 +407,55 @@ class _C99Emitter:
             )
         for function in self.module.functions:
             if function.external_abi is not None:
-                self.error(
-                    "E_C99_FFI",
-                    f"Extern declaration {function.name!r} is not supported by C99 v0",
-                    function.span,
-                )
+                if function.external_abi != "C":
+                    self.error(
+                        "E_C99_FFI",
+                        f"Foreign ABI {function.external_abi!r} is not supported",
+                        function.span,
+                    )
+                if (
+                    not function.name.isascii()
+                    or not function.name.isidentifier()
+                    or function.name.startswith("_")
+                    or function.name in _C_KEYWORDS
+                ):
+                    self.error(
+                        "E_C99_FFI_SYMBOL",
+                        f"Extern function name {function.name!r} is not a portable C symbol",
+                        function.span,
+                    )
+                if function.external_library is None:
+                    self.error(
+                        "E_C99_FFI_LIBRARY",
+                        f"Extern function {function.name!r} has no @link library",
+                        function.span,
+                    )
+                if set(function.declared_effects) != {"ffi"}:
+                    self.error(
+                        "E_C99_FFI_EFFECT",
+                        f"Extern function {function.name!r} may declare only @ffi",
+                        function.span,
+                    )
+                self.validate_type(function.return_type, function.span, "FFI return")
+                for parameter in function.parameters:
+                    self.validate_type(parameter.type, function.span, "FFI parameter")
+                if set(function.required_effects) != {"ffi"}:
+                    self.error(
+                        "E_C99_FFI_EFFECT",
+                        f"Extern function {function.name!r} must require @ffi",
+                        function.span,
+                    )
                 continue
             self.validate_type(function.return_type, function.span, "return")
             for parameter in function.parameters:
                 self.validate_type(parameter.type, function.span, "parameter")
-            if function.declared_effects or function.required_effects:
+            if (
+                set(function.declared_effects) - {"ffi"}
+                or set(function.required_effects) - {"ffi"}
+            ):
                 self.error(
                     "E_C99_EFFECT",
-                    f"Function {function.name!r} must be effect-free for C99 v0",
+                    f"Function {function.name!r} uses effects unsupported by C99 v0",
                     function.span,
                 )
             for statement in function.body:
@@ -499,7 +569,7 @@ class _C99Emitter:
             names.append(name)
         return _CValue(
             tuple(prelude),
-            f"{_encoded_identifier('aether_fn_', callee.value)}({', '.join(names)})",
+            f"{self._call_target(callee.value)}({', '.join(names)})",
             target.return_type,
         )
 
@@ -521,7 +591,7 @@ class _C99Emitter:
         target = self.functions[target_name]
         return _CValue(
             tuple(prelude),
-            f"{_encoded_identifier('aether_fn_', target_name)}({', '.join(names)})",
+            f"{self._call_target(target_name)}({', '.join(names)})",
             target.return_type,
         )
 
@@ -559,10 +629,16 @@ class _C99Emitter:
         else:
             output.append("")
         for function in self.module.functions:
-            output.append(self._function_signature(function) + ";")
+            output.append(
+                self._extern_signature(function)
+                if function.external_abi is not None
+                else self._function_signature(function) + ";"
+            )
         if self.module.functions:
             output.append("")
         for function in self.module.functions:
+            if function.external_abi is not None:
+                continue
             output.extend(self._emit_function(function))
             output.append("")
         if self.include_entry_point:
@@ -589,6 +665,21 @@ class _C99Emitter:
         ) or "void"
         name = _encoded_identifier("aether_fn_", function.name)
         return f"{return_type} {name}({parameters})"
+
+    def _extern_signature(self, function: IRFunction) -> str:
+        return_type = _C_TYPES[function.return_type.name]
+        parameters = ", ".join(
+            f"{_C_TYPES[parameter.type.name]} "
+            f"{_encoded_identifier('aether_v_', parameter.name)}"
+            for parameter in function.parameters
+        ) or "void"
+        return f"extern {return_type} {function.name}({parameters});"
+
+    def _call_target(self, name: str) -> str:
+        function = self.functions[name]
+        if function.external_abi is not None:
+            return function.name
+        return _encoded_identifier("aether_fn_", name)
 
     def _emit_function(self, function: IRFunction) -> list[str]:
         self.temp_index = 0
