@@ -7,6 +7,7 @@ from fractions import Fraction
 import re
 
 from src.frontend import (
+    AssignmentStmt,
     Diagnostic,
     Expr,
     ExprStmt,
@@ -17,6 +18,9 @@ from src.frontend import (
     SourceSpan,
     TypeDecl,
     TypeExpr,
+    UnitExpr,
+    _BUILTIN_CALLS,
+    parse_unit_expression_text,
 )
 
 
@@ -87,6 +91,38 @@ _UNITS: dict[str, UnitDefinition] = {
     "rad": UnitDefinition((("angle", 1),)),
     "deg": UnitDefinition((("angle", 1),), Fraction(1, 180), pi_power=1),
 }
+_SI_PREFIXES: dict[str, int] = {
+    "q": -30,
+    "r": -27,
+    "y": -24,
+    "z": -21,
+    "a": -18,
+    "f": -15,
+    "p": -12,
+    "n": -9,
+    "u": -6,
+    "m": -3,
+    "c": -2,
+    "d": -1,
+    "da": 1,
+    "h": 2,
+    "k": 3,
+    "M": 6,
+    "G": 9,
+    "T": 12,
+    "P": 15,
+    "E": 18,
+    "Z": 21,
+    "Y": 24,
+    "R": 27,
+    "Q": 30,
+}
+_PREFIXABLE_UNITS = frozenset(
+    symbol
+    for symbol, definition in _UNITS.items()
+    if symbol not in {"kg", "rad", "deg"}
+    and definition.kind != "absolute_temperature"
+)
 _EFFECTS = {"io", "net", "fs", "ffi"}
 
 
@@ -124,6 +160,13 @@ class AetherType:
             )
             suffix = f",{unit}" if unit else ""
             return f"Tensor<{self.arguments[0].display()},[{dimensions}]{suffix}>"
+        unit = self.unit_symbol or _unit_display(
+            self.unit,
+            self.unit_scale,
+            self.unit_pi_power,
+        )
+        if unit and self.is_numeric:
+            return f"{self.name}<{unit}>"
         if self.arguments:
             return f"{self.name}<" + ",".join(
                 argument.display() for argument in self.arguments
@@ -248,6 +291,88 @@ def _combine_units(
     return tuple(sorted((dimension, exponent) for dimension, exponent in result.items() if exponent))
 
 
+def _resolve_unit_symbol(symbol: str) -> UnitDefinition | None:
+    normalized = symbol.replace("µ", "u")
+    exact = _UNITS.get(normalized)
+    if exact is not None:
+        return exact
+    for prefix in sorted(_SI_PREFIXES, key=len, reverse=True):
+        if not normalized.startswith(prefix):
+            continue
+        base_name = normalized[len(prefix):]
+        if base_name not in _PREFIXABLE_UNITS:
+            continue
+        base = _UNITS[base_name]
+        exponent = _SI_PREFIXES[prefix]
+        scale = Fraction(10**exponent) if exponent >= 0 else Fraction(1, 10 ** -exponent)
+        return UnitDefinition(
+            base.dimensions,
+            base.scale * scale,
+            pi_power=base.pi_power,
+        )
+    return None
+
+
+def _unit_expression_definition(expression: UnitExpr) -> UnitDefinition:
+    if expression.kind == "dimensionless":
+        return UnitDefinition(())
+    if expression.kind == "symbol":
+        definition = _resolve_unit_symbol(expression.value)
+        if definition is None:
+            raise ValueError(f"Unknown or unsupported unit {expression.value!r}")
+        return definition
+    if expression.kind == "group":
+        return _unit_expression_definition(expression.children[0])
+    if expression.kind == "power":
+        base = _unit_expression_definition(expression.children[0])
+        if base.kind == "absolute_temperature" and expression.exponent != 1:
+            raise ValueError("Absolute-temperature units cannot be exponentiated")
+        if base.offset and expression.exponent != 1:
+            raise ValueError("Affine units cannot be exponentiated")
+        if expression.exponent == 0:
+            return UnitDefinition(())
+        return UnitDefinition(
+            tuple(
+                (dimension, exponent * expression.exponent)
+                for dimension, exponent in base.dimensions
+                if exponent * expression.exponent
+            ),
+            base.scale ** expression.exponent,
+            base.offset if expression.exponent == 1 else Fraction(0),
+            base.kind if expression.exponent == 1 else "",
+            base.pi_power * expression.exponent,
+        )
+    if expression.kind in {"multiply", "divide"}:
+        left = _unit_expression_definition(expression.children[0])
+        right = _unit_expression_definition(expression.children[1])
+        if left.kind == "absolute_temperature" or right.kind == "absolute_temperature":
+            raise ValueError("Absolute-temperature units cannot be composed")
+        sign = 1 if expression.kind == "multiply" else -1
+        scale = left.scale * (right.scale if sign > 0 else 1 / right.scale)
+        return UnitDefinition(
+            _combine_units(left.dimensions, right.dimensions, sign),
+            scale,
+            pi_power=left.pi_power + sign * right.pi_power,
+        )
+    raise ValueError(f"Unsupported unit expression kind {expression.kind!r}")
+
+
+def _unit_expression_symbol(expression: UnitExpr) -> str:
+    if expression.kind == "symbol":
+        return expression.value.replace("µ", "u")
+    if expression.kind == "dimensionless":
+        return "1"
+    if expression.kind == "group":
+        return f"({_unit_expression_symbol(expression.children[0])})"
+    if expression.kind == "power":
+        return f"{_unit_expression_symbol(expression.children[0])}^{expression.exponent}"
+    if expression.kind == "multiply":
+        return "*".join(_unit_expression_symbol(child) for child in expression.children)
+    if expression.kind == "divide":
+        return "/".join(_unit_expression_symbol(child) for child in expression.children)
+    return ""
+
+
 def _resolve_type(type_expr: TypeExpr) -> AetherType:
     if type_expr.name == "[]":
         return AetherType(
@@ -264,9 +389,15 @@ def _resolve_type(type_expr: TypeExpr) -> AetherType:
         ) if shape_expr.name == "[]" else ()
         unit = UnitDefinition(())
         unit_symbol = ""
-        if len(type_expr.arguments) >= 3:
+        if type_expr.unit_expression is not None:
+            try:
+                unit = _unit_expression_definition(type_expr.unit_expression)
+                unit_symbol = _unit_expression_symbol(type_expr.unit_expression)
+            except ValueError:
+                pass
+        elif len(type_expr.arguments) >= 3:
             unit_symbol = type_expr.arguments[2].name
-            unit = _UNITS.get(unit_symbol, UnitDefinition(()))
+            unit = _resolve_unit_symbol(unit_symbol) or UnitDefinition(())
         return AetherType(
             "Tensor",
             (arguments[0],),
@@ -277,6 +408,21 @@ def _resolve_type(type_expr: TypeExpr) -> AetherType:
             unit_symbol,
             unit.kind,
             unit.pi_power,
+        )
+    if type_expr.unit_expression is not None:
+        try:
+            unit = _unit_expression_definition(type_expr.unit_expression)
+        except ValueError:
+            unit = UnitDefinition(())
+        return AetherType(
+            type_expr.name,
+            arguments,
+            unit=unit.dimensions,
+            unit_scale=unit.scale,
+            unit_offset=unit.offset,
+            unit_symbol=_unit_expression_symbol(type_expr.unit_expression),
+            unit_kind=unit.kind,
+            unit_pi_power=unit.pi_power,
         )
     return AetherType(type_expr.name, arguments)
 
@@ -307,8 +453,12 @@ def _same_unit(left: AetherType, right: AetherType) -> bool:
     )
 
 
-def _with_unit(value: AetherType, unit_symbol: str) -> AetherType:
-    definition = _UNITS[unit_symbol]
+def _with_unit(
+    value: AetherType,
+    unit_symbol: str,
+    definition: UnitDefinition,
+) -> AetherType:
+    normalized_symbol = unit_symbol.replace("µ", "u")
     return AetherType(
         value.name,
         value.arguments,
@@ -316,7 +466,7 @@ def _with_unit(value: AetherType, unit_symbol: str) -> AetherType:
         definition.dimensions,
         definition.scale,
         definition.offset,
-        unit_symbol,
+        normalized_symbol,
         definition.kind,
         definition.pi_power,
     )
@@ -351,14 +501,18 @@ class _Analyzer:
         self.expression_types: list[tuple[SourceSpan, AetherType]] = []
         self.conversions: list[UnitConversion] = []
         self.current_return_type: AetherType | None = None
+        self.effect_summaries: dict[str, EffectSummary] = {}
 
     def error(self, code: str, message: str, span: SourceSpan) -> None:
         self.diagnostics.append(Diagnostic(code, message, span))
 
     def analyze(self) -> SemanticResult:
         summaries = self._analyze_effects()
+        self.effect_summaries = {
+            summary.function: summary for summary in summaries
+        }
         for function in self.functions.values():
-            if function.name in _BUILTIN_OPERATIONS:
+            if function.name in _BUILTIN_OPERATIONS or function.name in _BUILTIN_CALLS:
                 self.error(
                     "E_RESERVED_NAME",
                     f"Function name {function.name!r} is reserved for a built-in operation",
@@ -367,8 +521,23 @@ class _Analyzer:
             if function.external_abi is not None:
                 self._validate_extern_function(function)
         for declaration in self.types.values():
+            if declaration.name == "FrameBuffer":
+                self.error(
+                    "E_RESERVED_TYPE",
+                    "Type name 'FrameBuffer' is reserved for frame-managed storage",
+                    declaration.span,
+                )
             for field in declaration.fields:
                 self._validate_type(field.type)
+                if field.type.name == "FrameBuffer" or any(
+                    argument.name == "FrameBuffer"
+                    for argument in field.type.arguments
+                ):
+                    self.error(
+                        "E_FRAME_BUFFER_ESCAPE",
+                        "FrameBuffer ownership cannot be stored in user aggregates",
+                        field.type.span,
+                    )
         for function in self.functions.values():
             self._analyze_function(function)
         return SemanticResult(
@@ -426,7 +595,7 @@ class _Analyzer:
 
     @staticmethod
     def _is_ffi_type(type_expr: TypeExpr, *, allow_void: bool) -> bool:
-        if type_expr.arguments or type_expr.dimensions:
+        if type_expr.arguments or type_expr.dimensions or type_expr.unit_expression:
             return False
         if type_expr.name == "void":
             return allow_void
@@ -435,6 +604,25 @@ class _Analyzer:
     def _validate_type(self, type_expr: TypeExpr) -> None:
         for argument in type_expr.arguments:
             self._validate_type(argument)
+        if type_expr.unit_expression is not None:
+            if type_expr.name != "Tensor" and type_expr.name not in _NUMERIC_TYPES:
+                self.error(
+                    "E_UNIT_TYPE",
+                    "Unit annotations are supported only on numeric and Tensor types",
+                    type_expr.span,
+                )
+            try:
+                _unit_expression_definition(type_expr.unit_expression)
+            except ValueError as error:
+                message = str(error)
+                code = (
+                    "E_UNKNOWN_UNIT"
+                    if message.startswith("Unknown or unsupported unit")
+                    else "E_UNIT_EXPRESSION"
+                )
+                self.error(code, message, type_expr.unit_expression.span)
+        if type_expr.name == "FrameBuffer":
+            return
         if type_expr.name == "Result":
             if len(type_expr.arguments) != 2:
                 self.error(
@@ -483,6 +671,12 @@ class _Analyzer:
                 shape.span,
             )
             return
+        if not shape.dimensions:
+            self.error(
+                "E_TENSOR_SHAPE",
+                "Tensor shape must contain at least one static dimension",
+                shape.span,
+            )
         for dimension in shape.dimensions:
             if not dimension.isdecimal() or int(dimension) <= 0:
                 self.error(
@@ -492,7 +686,7 @@ class _Analyzer:
                 )
         if len(type_expr.arguments) == 3:
             unit = type_expr.arguments[2]
-            if unit.name not in _UNITS or unit.arguments:
+            if _resolve_unit_symbol(unit.name) is None or unit.arguments:
                 self.error(
                     "E_UNKNOWN_UNIT",
                     f"Unknown or unsupported unit {unit.name!r}",
@@ -557,6 +751,12 @@ class _Analyzer:
         )
 
     def _analyze_function(self, function: FunctionDecl) -> None:
+        def contains_frame_buffer(type_: AetherType | None) -> bool:
+            return type_ is not None and (
+                type_.name == "FrameBuffer"
+                or any(contains_frame_buffer(argument) for argument in type_.arguments)
+            )
+
         for parameter in function.parameters:
             self._validate_type(parameter.type)
         environment = {
@@ -573,6 +773,7 @@ class _Analyzer:
             self._validate_type(function.return_type)
         result_bindings: dict[str, SourceSpan] = {}
         handled_results: set[str] = set()
+        mutable_bindings: set[str] = set()
         reachable = True
         for statement in function.body:
             was_reachable = reachable
@@ -598,6 +799,18 @@ class _Analyzer:
                     if statement.annotation is not None
                     else None
                 )
+                if (
+                    contains_frame_buffer(inferred)
+                    or contains_frame_buffer(annotation)
+                ) and (
+                    statement.binding_kind == "const"
+                    or annotation is not None
+                ):
+                    self.error(
+                        "E_FRAME_BUFFER_OWNERSHIP",
+                        "FrameBuffer-containing locals must use unannotated let or var bindings",
+                        statement.span,
+                    )
                 if annotation is not None and inferred is not None and not _compatible(annotation, inferred):
                     self.error(
                         "E_TYPE_MISMATCH",
@@ -606,6 +819,9 @@ class _Analyzer:
                         statement.span,
                     )
                 environment[statement.name] = annotation or inferred or AetherType("Unknown")
+                self._validate_frame_buffer_usage(statement.value, environment)
+                if statement.binding_kind == "var":
+                    mutable_bindings.add(statement.name)
                 if reachable and inferred is not None and inferred.name == "Result":
                     result_bindings[statement.name] = statement.span
                 elif reachable and statement.value.kind == "identifier":
@@ -614,12 +830,58 @@ class _Analyzer:
                         result_bindings.pop(source_name)
                         if inferred is not None and inferred.name == "Result":
                             result_bindings[statement.name] = statement.span
+            elif isinstance(statement, AssignmentStmt):
+                target_type = environment.get(statement.name)
+                inferred = self._infer(statement.value, environment)
+                self._validate_frame_buffer_usage(statement.value, environment)
+                if target_type is None:
+                    self.error(
+                        "E_UNKNOWN_NAME",
+                        f"Unknown assignment target {statement.name!r}",
+                        statement.span,
+                    )
+                elif statement.name not in mutable_bindings:
+                    self.error(
+                        "E_ASSIGN_IMMUTABLE",
+                        f"Cannot rebind immutable value {statement.name!r}; "
+                        "declare it with 'var'",
+                        statement.span,
+                    )
+                elif inferred is not None and not _compatible(target_type, inferred):
+                    self.error(
+                        _mismatch_code(target_type, inferred),
+                        f"Cannot rebind {statement.name!r} of type "
+                        f"{target_type.display()} with {inferred.display()}",
+                        statement.span,
+                    )
+                if target_type is not None and (
+                    target_type.name == "Result"
+                    or (inferred is not None and inferred.name == "Result")
+                ):
+                    self.error(
+                        "E_ASSIGN_RESULT_UNSUPPORTED",
+                        "Rebinding Result values is not supported",
+                        statement.span,
+                    )
+                if (
+                    target_type is not None
+                    and target_type.name == "FrameBuffer"
+                    and inferred is not None
+                    and inferred.name != "FrameBuffer"
+                ):
+                    self.error(
+                        "E_FRAME_BUFFER_OWNERSHIP",
+                        "FrameBuffer rebinding requires another FrameBuffer value",
+                        statement.span,
+                    )
             elif isinstance(statement, ReturnStmt):
                 actual = (
                     self._infer(statement.value, environment)
                     if statement.value is not None
                     else AetherType("void")
                 )
+                if statement.value is not None:
+                    self._validate_frame_buffer_usage(statement.value, environment)
                 propagates_result = (
                     expected_return is not None
                     and expected_return.name == "Result"
@@ -653,6 +915,7 @@ class _Analyzer:
                 reachable = False
             elif isinstance(statement, ExprStmt):
                 actual = self._infer(statement.expression, environment)
+                self._validate_frame_buffer_usage(statement.expression, environment)
                 if actual is not None and actual.name == "Result":
                     self.error(
                         "E_UNHANDLED_RESULT",
@@ -660,6 +923,8 @@ class _Analyzer:
                         statement.span,
                     )
             if isinstance(statement, LetStmt):
+                consumed = _consumed_result_names(statement.value, "bind")
+            elif isinstance(statement, AssignmentStmt):
                 consumed = _consumed_result_names(statement.value, "bind")
             elif isinstance(statement, ExprStmt):
                 consumed = _consumed_result_names(statement.expression, "expression")
@@ -685,6 +950,108 @@ class _Analyzer:
                 span,
             )
         self.current_return_type = None
+
+    def _validate_frame_buffer_usage(
+        self,
+        expression: Expr,
+        environment: dict[str, AetherType],
+    ) -> None:
+        def contains_resource(type_: AetherType) -> bool:
+            return type_.name == "FrameBuffer" or any(
+                contains_resource(argument) for argument in type_.arguments
+            )
+
+        def inferred_type(node: Expr) -> AetherType:
+            if node.kind == "identifier":
+                return environment.get(node.value, self._type_at(node.span))
+            return self._type_at(node.span)
+
+        def visit(node: Expr) -> None:
+            type_ = inferred_type(node)
+            if contains_resource(type_):
+                if node.kind in {"identifier", "try", "group"}:
+                    if node.kind == "try" and node.children:
+                        visit(node.children[0])
+                    elif node.kind == "group" and node.children:
+                        visit(node.children[0])
+                    return
+                if node.kind == "call" and node.children:
+                    callee = node.children[0]
+                    name = callee.value if callee.kind == "identifier" else ""
+                    if name == "frame_buffer":
+                        for argument in node.children[1:]:
+                            visit(argument)
+                        return
+                    if name == "frame_buffer_len":
+                        if len(node.children) == 2 and not contains_resource(
+                            inferred_type(node.children[1])
+                        ):
+                            self.error(
+                                "E_FRAME_BUFFER_OWNERSHIP",
+                                "frame_buffer_len requires a FrameBuffer value",
+                                node.children[1].span,
+                            )
+                        for argument in node.children[1:]:
+                            visit(argument)
+                        return
+                    if name in {"Ok", "Err"}:
+                        for argument in node.children[1:]:
+                            visit(argument)
+                        return
+                    target = self.functions.get(name)
+                    if target is not None:
+                        for argument, parameter in zip(
+                            node.children[1:], target.parameters
+                        ):
+                            visit(argument)
+                            if (
+                                contains_resource(_resolve_type(parameter.type))
+                                and not contains_resource(inferred_type(argument))
+                            ):
+                                self.error(
+                                    "E_FRAME_BUFFER_OWNERSHIP",
+                                    "FrameBuffer parameter requires an owned or borrowed FrameBuffer value",
+                                    argument.span,
+                                )
+                        return
+                self.error(
+                    "E_FRAME_BUFFER_OWNERSHIP",
+                    "FrameBuffer values may only be copied, passed, or returned as values",
+                    node.span,
+                )
+                return
+
+            if node.kind == "call" and node.children:
+                callee = node.children[0]
+                name = callee.value if callee.kind == "identifier" else ""
+                target = self.functions.get(name)
+                if target is not None:
+                    for argument, parameter in zip(
+                        node.children[1:], target.parameters
+                    ):
+                        visit(argument)
+                        if (
+                            contains_resource(_resolve_type(parameter.type))
+                            and not contains_resource(inferred_type(argument))
+                        ):
+                            self.error(
+                                "E_FRAME_BUFFER_OWNERSHIP",
+                                "FrameBuffer parameter requires a FrameBuffer value",
+                                argument.span,
+                            )
+                    return
+            for child in node.children:
+                visit(child)
+            for arm in node.arms:
+                visit(arm.value)
+
+        visit(expression)
+
+    def _type_at(self, span: SourceSpan) -> AetherType:
+        for expression_span, type_ in reversed(self.expression_types):
+            if expression_span == span:
+                return type_
+        return AetherType("Unknown")
 
     def _record(self, expression: Expr, value: AetherType | None) -> AetherType | None:
         if value is not None:
@@ -854,7 +1221,18 @@ class _Analyzer:
             return self._record(expression, None)
         if expression.kind == "unary":
             operand = self._infer(expression.children[0], environment)
-            if operand is not None and expression.value in {"+", "-"} and not operand.is_numeric:
+            is_numeric_tensor = (
+                operand is not None
+                and operand.name == "Tensor"
+                and operand.element_type is not None
+                and operand.element_type.is_numeric
+            )
+            if (
+                operand is not None
+                and expression.value in {"+", "-"}
+                and not operand.is_numeric
+                and not is_numeric_tensor
+            ):
                 self.error("E_TYPE_OPERATOR", f"Unary {expression.value} requires a numeric value", expression.span)
                 return None
             if operand is not None and expression.value == "!" and operand.name != "bool":
@@ -915,6 +1293,13 @@ class _Analyzer:
                 return None
             return AetherType("bool")
         if operator in {"==", "!=", "<", ">", "<=", ">="}:
+            if left.name == "Tensor" or right.name == "Tensor":
+                self.error(
+                    "E_TENSOR_COMPARISON",
+                    "Tensor comparisons are not supported until boolean tensor types are defined",
+                    expression.span,
+                )
+                return None
             if not _compatible(left, right):
                 self.error(
                     _mismatch_code(left, right),
@@ -1080,6 +1465,93 @@ class _Analyzer:
             self._infer(callee, environment)
             return None
         name = callee.value
+        if name == "gradient":
+            return self._infer_gradient(expression, environment, pipeline_input)
+        if name == "frame_buffer":
+            if pipeline_input is not None or len(expression.children) != 2:
+                self.error(
+                    "E_BUILTIN_ARITY",
+                    "frame_buffer expects exactly one byte count",
+                    expression.span,
+                )
+                return None
+            size_type = self._infer(expression.children[1], environment)
+            if size_type is not None and size_type.name != "u64":
+                self.error(
+                    "E_BUILTIN_TYPE",
+                    "frame_buffer byte count must have type u64",
+                    expression.children[1].span,
+                )
+                return None
+            if size_type is None:
+                return None
+            return self._record(expression, AetherType("FrameBuffer"))
+        if name == "frame_buffer_len":
+            if pipeline_input is not None or len(expression.children) != 2:
+                self.error(
+                    "E_BUILTIN_ARITY",
+                    "frame_buffer_len expects exactly one local FrameBuffer",
+                    expression.span,
+                )
+                return None
+            buffer_type = self._infer(expression.children[1], environment)
+            if buffer_type is not None and buffer_type.name != "FrameBuffer":
+                return self._builtin_type_error(
+                    name,
+                    "expects a local FrameBuffer",
+                    expression.children[1].span,
+                )
+            if buffer_type is None:
+                return None
+            return self._record(expression, AetherType("u64"))
+        if name in {"Ok", "Err"}:
+            if pipeline_input is not None or len(expression.children) != 2:
+                self.error(
+                    "E_RESULT_CONSTRUCTOR_ARITY",
+                    f"{name} expects exactly one payload",
+                    expression.span,
+                )
+                return None
+            expected = self.current_return_type
+            if expected is None or expected.name != "Result" or len(expected.arguments) != 2:
+                self.error(
+                    "E_RESULT_CONSTRUCTOR_CONTEXT",
+                    f"{name} must be returned from a function with an annotated Result type",
+                    expression.span,
+                )
+                return None
+            if name == "Err":
+                marker = expression.children[1]
+                if marker.kind != "identifier" or marker.value not in {
+                    "IoError", "FsError", "NetError"
+                }:
+                    self.error(
+                        "E_RESULT_CONSTRUCTOR_TYPE",
+                        "Err payload must be an error category marker",
+                        marker.span,
+                    )
+                    return None
+                payload = self._record(marker, AetherType(marker.value))
+            else:
+                payload = self._infer(expression.children[1], environment)
+            if payload is None:
+                return None
+            if name == "Ok":
+                if not _compatible(expected.arguments[0], payload):
+                    self.error(
+                        "E_RESULT_CONSTRUCTOR_TYPE",
+                        f"Ok payload must have type {expected.arguments[0].display()}",
+                        expression.span,
+                    )
+                    return None
+            elif payload != expected.arguments[1]:
+                self.error(
+                    "E_RESULT_CONSTRUCTOR_TYPE",
+                    f"Err payload must be {expected.arguments[1].display()}",
+                    expression.span,
+                )
+                return None
+            return self._record(expression, expected)
         if name == "convert":
             raw_arguments = list(expression.children[1:])
             expected_arity = 2 if pipeline_input is None else 1
@@ -1108,11 +1580,15 @@ class _Analyzer:
                 )
                 return None
             target_name = unit_expression.value[1:-1]
-            target = _UNITS.get(target_name)
-            if target is None:
+            try:
+                target_expression = parse_unit_expression_text(target_name)
+                target = _unit_expression_definition(target_expression)
+            except ValueError as error:
                 self.error(
-                    "E_UNKNOWN_UNIT",
-                    f"Unknown unit {target_name!r}",
+                    "E_UNKNOWN_UNIT"
+                    if "Unknown or unsupported unit" in str(error)
+                    else "E_UNIT_EXPRESSION",
+                    str(error),
                     unit_expression.span,
                 )
                 return None
@@ -1149,7 +1625,7 @@ class _Analyzer:
                     target_name,
                 )
             )
-            return _with_unit(value_type, target_name)
+            return _with_unit(value_type, target_name, target)
 
         arguments = [
             self._infer(argument, environment)
@@ -1210,6 +1686,7 @@ class _Analyzer:
                     "expects a tensor argument",
                     expression.span,
                 )
+
             element = argument.arguments[0]
             if name == "mean" and element.name not in _FLOAT_TYPES:
                 element = AetherType("f32")
@@ -1266,6 +1743,172 @@ class _Analyzer:
             return AetherType("i64")
         return None
 
+    def _infer_gradient(
+        self,
+        expression: Expr,
+        environment: dict[str, AetherType],
+        pipeline_input: AetherType | None,
+    ) -> AetherType | None:
+        if pipeline_input is not None:
+            self.error(
+                "E_GRADIENT_ARITY",
+                "gradient must be called as gradient(function, value)",
+                expression.span,
+            )
+            return None
+        arguments = expression.children[1:]
+        if len(arguments) != 2:
+            self.error(
+                "E_GRADIENT_ARITY",
+                "gradient expects a function name and one scalar input",
+                expression.span,
+            )
+            return None
+        target_expression, input_expression = arguments
+        if target_expression.kind != "identifier":
+            self.error(
+                "E_GRADIENT_TARGET",
+                "gradient target must be a named function",
+                target_expression.span,
+            )
+            return None
+        target = self.functions.get(target_expression.value)
+        if target is None:
+            self.error(
+                "E_GRADIENT_TARGET",
+                f"Unknown gradient target {target_expression.value!r}",
+                target_expression.span,
+            )
+            return None
+        input_type = self._infer(input_expression, environment)
+        if input_type is None:
+            return None
+        if target.external_abi is not None:
+            self.error(
+                "E_GRADIENT_EFFECT",
+                "Extern functions cannot be differentiated",
+                target.span,
+            )
+            return None
+        if len(target.parameters) != 1:
+            self.error(
+                "E_GRADIENT_SIGNATURE",
+                "Autodiff v0 requires a unary target function",
+                target.span,
+            )
+            return None
+        parameter_type = _resolve_type(target.parameters[0].type)
+        return_type = (
+            _resolve_type(target.return_type)
+            if target.return_type is not None
+            else None
+        )
+        is_scalar_gradient = (
+            _is_unitless_float(parameter_type)
+            and _is_unitless_float(input_type)
+            and parameter_type == input_type
+        )
+        is_tensor_gradient = (
+            parameter_type.name == "Tensor"
+            and input_type.name == "Tensor"
+            and parameter_type.arguments == input_type.arguments
+            and parameter_type.dimensions == input_type.dimensions
+            and _same_unit(parameter_type, input_type)
+            and parameter_type.element_type is not None
+            and parameter_type.element_type.name in {"f32", "f64"}
+        )
+        if not (is_scalar_gradient or is_tensor_gradient):
+            self.error(
+                "E_GRADIENT_TYPE",
+                "Autodiff requires an input matching the target's f32/f64 "
+                "scalar or static tensor parameter type",
+                expression.span,
+            )
+            return None
+        if return_type is None or return_type.name not in {"f32", "f64"}:
+            self.error(
+                "E_GRADIENT_TYPE",
+                "Autodiff requires an explicitly annotated f32 or f64 scalar result",
+                target.span,
+            )
+            return None
+        if is_scalar_gradient and not _is_unitless_float(return_type):
+            self.error(
+                "E_GRADIENT_TYPE",
+                "Scalar autodiff v0 requires a unitless result",
+                target.span,
+            )
+            return None
+        if is_tensor_gradient and (
+            return_type.name != parameter_type.element_type.name
+            or not _is_linear_autodiff_unit(parameter_type)
+            or not _is_linear_autodiff_unit(return_type)
+        ):
+            self.error(
+                "E_GRADIENT_UNIT",
+                "Tensor autodiff requires matching f32/f64 element types and "
+                "linear input and output units",
+                target.span,
+            )
+            return None
+        summary = self.effect_summaries.get(target.name)
+        if summary is None or summary.required or summary.declared:
+            self.error(
+                "E_GRADIENT_EFFECT",
+                "Autodiff v0 supports only pure functions without declared effects",
+                target.span,
+            )
+            return None
+        if (
+            len(target.body) < 1
+            or not isinstance(target.body[-1], ReturnStmt)
+            or target.body[-1].value is None
+            or any(not isinstance(statement, LetStmt) for statement in target.body[:-1])
+        ):
+            self.error(
+                "E_GRADIENT_CONTROL_FLOW",
+                "Autodiff v0 supports only local bindings followed by one final return",
+                target.span,
+            )
+            return None
+        for statement in target.body:
+            value = (
+                statement.value
+                if isinstance(statement, (LetStmt, ReturnStmt))
+                else None
+            )
+            if value is not None and not _is_differentiable_expression(value):
+                self.error(
+                    "E_GRADIENT_OPERATION",
+                    "Autodiff supports literals, names, unary +/- and binary "
+                    "+, -, *, /; tensor objectives also support sum and mean",
+                    value.span,
+                )
+                return None
+        if is_scalar_gradient:
+            return self._record(expression, parameter_type)
+        assert parameter_type.element_type is not None
+        unit = _combine_units(return_type.unit, parameter_type.unit, -1)
+        scale = return_type.unit_scale / parameter_type.unit_scale
+        output_symbol = return_type.unit_symbol or "1"
+        input_symbol = parameter_type.unit_symbol or "1"
+        unit_symbol = (
+            ""
+            if output_symbol == input_symbol and scale == 1 and not unit
+            else f"{output_symbol}/{input_symbol}"
+        )
+        return self._record(
+            expression,
+            AetherType(
+                "Tensor",
+                (parameter_type.element_type,),
+                parameter_type.dimensions,
+                unit,
+                scale,
+                unit_symbol=unit_symbol,
+            ),
+        )
+
     def _builtin_arity_error(
         self,
         name: str,
@@ -1303,6 +1946,71 @@ def _numeric_result(left: AetherType, right: AetherType) -> AetherType:
         unit_kind=left.unit_kind,
         unit_pi_power=left.unit_pi_power,
     )
+
+
+def _is_unitless_float(type_: AetherType) -> bool:
+    return type_.name in {"f32", "f64"} and not (
+        type_.unit
+        or type_.unit_scale != 1
+        or type_.unit_offset
+        or type_.unit_symbol
+        or type_.unit_kind
+        or type_.unit_pi_power
+    )
+
+
+def _is_linear_autodiff_unit(type_: AetherType) -> bool:
+    return not (
+        type_.unit_kind == "absolute_temperature"
+        or type_.unit_offset
+        or type_.unit_pi_power
+        or any(dimension == "angle" for dimension, _ in type_.unit)
+    )
+
+
+def _is_differentiable_expression(expression: Expr) -> bool:
+    if expression.kind == "literal":
+        return bool(
+            re.fullmatch(
+                r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+                expression.value,
+            )
+        )
+    if expression.kind == "identifier":
+        return True
+    if expression.kind == "group":
+        return len(expression.children) == 1 and _is_differentiable_expression(
+            expression.children[0]
+        )
+    if expression.kind == "unary":
+        return (
+            expression.value in {"+", "-"}
+            and len(expression.children) == 1
+            and _is_differentiable_expression(expression.children[0])
+        )
+    if expression.kind == "binary":
+        return (
+            expression.value in {"+", "-", "*", "/"}
+            and len(expression.children) == 2
+            and all(_is_differentiable_expression(child) for child in expression.children)
+        )
+    if expression.kind == "call":
+        if not expression.children or expression.children[0].kind != "identifier":
+            return False
+        callee = expression.children[0].value
+        if callee in {"sum", "mean"}:
+            return (
+                len(expression.children) == 2
+                and _is_differentiable_expression(expression.children[1])
+            )
+        return (
+            callee == "convert"
+            and len(expression.children) == 3
+            and _is_differentiable_expression(expression.children[1])
+            and expression.children[2].kind == "literal"
+            and expression.children[2].value.startswith(("'", '"'))
+        )
+    return False
 
 
 def _consumed_result_names(expression: Expr, context: str) -> set[str]:
@@ -1356,7 +2064,7 @@ def _mismatch_code(left: AetherType, right: AetherType) -> str:
 
 
 def _statement_expression(statement):
-    if isinstance(statement, LetStmt):
+    if isinstance(statement, (LetStmt, AssignmentStmt)):
         return statement.value
     if isinstance(statement, ReturnStmt):
         return statement.value

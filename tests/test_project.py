@@ -1,25 +1,63 @@
-from pathlib import Path
+import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from src.api import (
     CompilationError,
     build_project_executable,
     build_project_object,
+    build_project_objects,
     compile_project,
     compile_source,
     emit_c99_project,
+    link_project_objects,
     run_project,
 )
-from src.build import C99LinkConfigurationError, compile_c99_object
+from src.build import (
+    C99BuildError,
+    C99LinkConfigurationError,
+    C99ToolchainError,
+    compile_c99_object,
+)
+from src.c99 import emit_c99_module_units
 from src.frontend import parse_source, render_module
 from src.interpreter import ResultValue
 
 
 class ProjectTests(unittest.TestCase):
+    def test_imported_var_rebinding_is_preserved_in_project_ir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "values.hl").write_text(
+                "fn update() -> i32 {\n"
+                "    var value = 1;\n"
+                "    value = 42;\n"
+                "    return value;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "values.hl" as values;\n'
+                "fn main() -> i32 { return values::update(); }\n",
+                encoding="utf-8",
+            )
+
+            result = run_project(entry, "main")
+            module = compile_project(entry)
+
+        self.assertEqual(result, 42)
+        imported_update = next(
+            function for function in module.functions if function.name.endswith("update")
+        )
+        self.assertTrue(any(statement.kind == "assignment" for statement in imported_update.body))
+
     def compiler(self) -> tuple[str, ...]:
         configured_compiler = os.environ.get("AETHER_C99_COMPILER")
         if configured_compiler:
@@ -46,6 +84,31 @@ class ProjectTests(unittest.TestCase):
         if os.environ.get("AETHER_REQUIRE_C99_COMPILER") == "1":
             self.fail(f"{message}; this test environment requires one")
         self.skipTest(message)
+
+    def controllable_compiler(
+        self,
+        project: Path,
+        delegate: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], Path]:
+        configuration = project / "compiler.json"
+        script = project / "compiler_wrapper.py"
+        script.write_text(
+            "import json, pathlib, subprocess, sys\n"
+            f"delegate = {list(delegate)!r}\n"
+            f"configuration = pathlib.Path({str(configuration)!r})\n"
+            "settings = json.loads(configuration.read_text(encoding='utf-8'))\n"
+            "arguments = sys.argv[1:]\n"
+            "if arguments[-1:] == ['--version']:\n"
+            "    print(settings['version'])\n"
+            "    raise SystemExit(0)\n"
+            "if arguments[-1:] == ['-dumpmachine']:\n"
+            "    print(settings['target'])\n"
+            "    raise SystemExit(0)\n"
+            "result = subprocess.run([*delegate, *arguments], check=False)\n"
+            "raise SystemExit(result.returncode)\n",
+            encoding="utf-8",
+        )
+        return (sys.executable, str(script)), configuration
 
     def test_import_syntax_roundtrips_and_requires_project_api(self) -> None:
         source = (
@@ -89,22 +152,69 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(result, 42)
         self.assertEqual(len(module.functions), 2)
 
-    def test_project_emits_and_builds_c99_across_modules(self) -> None:
+    def test_project_gradient_resolves_imported_target(self) -> None:
         compiler = self.compiler()
         with tempfile.TemporaryDirectory() as temporary_directory:
             project = Path(temporary_directory)
+            (project / "math.hl").write_text(
+                "fn square(value: f32) -> f32 { return value * value; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "math.hl" as math;\n'
+                "fn derivative(value: f32) -> f32 {\n"
+                "    return gradient(math::square, value);\n"
+                "}\n"
+                "fn main() -> i32 { return 0; }\n",
+                encoding="utf-8",
+            )
+
+            interpreted = run_project(entry, "derivative", 3.0)
+            executable = build_project_executable(
+                entry,
+                project / "program.exe",
+                compiler=compiler,
+            )
+            native = subprocess.run(
+                [str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        self.assertAlmostEqual(interpreted, 6.0)
+        self.assertEqual(native.returncode, 0, native.stderr)
+
+    def test_project_emits_and_builds_c99_across_modules(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory) / "project with spaces"
+            project.mkdir()
+            (project / "helper.hl").write_text(
+                "fn scale(value: i32, factor: i32) -> i32 {\n"
+                "    return value * factor;\n"
+                "}\n",
+                encoding="utf-8",
+            )
             (project / "left.hl").write_text(
-                "fn double(value: i32) -> i32 { return value * 2; }\n",
+                'import "helper.hl" as helper;\n'
+                "fn double(value: i32) -> i32 {\n"
+                "    return helper::scale(value, 2);\n"
+                "}\n",
                 encoding="utf-8",
             )
             (project / "right.hl").write_text(
                 "fn double(value: i32) -> i32 { return value * 2; }\n",
                 encoding="utf-8",
             )
+            (project / "empty.hl").write_text("", encoding="utf-8")
             entry = project / "main.hl"
             entry.write_text(
                 'import "left.hl" as left;\n'
                 'import "right.hl" as right;\n'
+                'import "empty.hl" as empty;\n'
                 "fn main() -> i32 {\n"
                 "    return (20 |> left::double) + right::double(1);\n"
                 "}\n",
@@ -114,6 +224,29 @@ class ProjectTests(unittest.TestCase):
             reference_result = run_project(entry, "main")
             generated = emit_c99_project(entry)
             self.assertEqual(generated, emit_c99_project(entry))
+            project_module = compile_project(entry)
+            generated_units = emit_c99_module_units(
+                project_module,
+                str(entry.resolve()),
+            )
+            self.assertEqual(len(generated_units), 5)
+            self.assertEqual(
+                sum("int main(void)" in unit for _, unit in generated_units),
+                1,
+            )
+            for function in project_module.functions:
+                signature = (
+                    "int32_t aether_fn_"
+                    + function.name.encode("utf-8").hex()
+                    + "("
+                )
+                self.assertEqual(
+                    sum(
+                        unit.count(signature) == 2
+                        for _, unit in generated_units
+                    ),
+                    1,
+                )
             object_file = build_project_object(
                 entry,
                 project / "program.o",
@@ -134,6 +267,865 @@ class ProjectTests(unittest.TestCase):
             )
         self.assertIn("aether_fn_", generated)
         self.assertEqual(result.returncode, reference_result, result.stderr)
+
+    def test_build_project_objects_returns_separately_linkable_module_objects(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory) / "source tree with spaces"
+            project.mkdir()
+            (project / "left").mkdir()
+            (project / "right").mkdir()
+            (project / "left" / "worker.hl").write_text(
+                "fn value() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            (project / "right" / "worker.hl").write_text(
+                "fn value() -> i32 { return 30; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "left/worker.hl" as left;\n'
+                'import "right/worker.hl" as right;\n'
+                "fn main() -> i32 { return left::value() + right::value(); }\n",
+                encoding="utf-8",
+            )
+            reference_result = run_project(entry, "main")
+            output_directory = Path(temporary_directory) / "objects with spaces"
+
+            object_paths = build_project_objects(
+                entry,
+                output_directory,
+                compiler=compiler,
+            )
+            manifest = json.loads(
+                (output_directory / "aether-objects.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            repeated_object_paths = build_project_objects(
+                entry,
+                Path(temporary_directory) / "repeat objects",
+                compiler=compiler,
+            )
+            self.assertEqual(
+                set(object_paths),
+                {Path("main.hl"), Path("left/worker.hl"), Path("right/worker.hl")},
+            )
+            self.assertEqual(len({path.name for path in object_paths.values()}), 3)
+            self.assertEqual(
+                {source: path.name for source, path in object_paths.items()},
+                {
+                    source: path.name
+                    for source, path in repeated_object_paths.items()
+                },
+            )
+            self.assertEqual(
+                {
+                    source: path.read_bytes()
+                    for source, path in object_paths.items()
+                },
+                {
+                    source: path.read_bytes()
+                    for source, path in repeated_object_paths.items()
+                },
+            )
+            self.assertTrue(all(path.is_file() for path in object_paths.values()))
+            self.assertEqual(manifest["format"], "aether-object-set")
+            self.assertEqual(manifest["version"], 2)
+            self.assertEqual(
+                set(manifest["toolchain"]),
+                {
+                    "executable",
+                    "command_sha256",
+                    "version",
+                    "target",
+                    "compile_flags",
+                    "link_flags",
+                },
+            )
+            self.assertEqual(
+                manifest["toolchain"]["compile_flags"],
+                [
+                    "-std=c99",
+                    "-pedantic",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-ffp-contract=off",
+                    "-frandom-seed=aether",
+                    "-c",
+                ],
+            )
+            self.assertEqual(
+                {record["source"] for record in manifest["modules"]},
+                {"main.hl", "left/worker.hl", "right/worker.hl"},
+            )
+            self.assertTrue(
+                all(len(record["object_sha256"]) == 64 for record in manifest["modules"])
+            )
+
+            executable = Path(temporary_directory) / "linked.exe"
+            linked = link_project_objects(
+                entry,
+                object_paths,
+                executable,
+                compiler=compiler,
+            )
+            self.assertEqual(linked, executable.resolve())
+            execution = subprocess.run(
+                [str(executable)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        self.assertEqual(execution.returncode, reference_result)
+
+    def test_project_source_hash_and_objects_ignore_line_ending_style(self) -> None:
+        compiler = self.compiler()
+        source = (
+            "fn helper(value: i32) -> i32 {\n"
+            "    return value + 1;\n"
+            "}\n"
+            "fn main() -> i32 {\n"
+            "    return helper(41);\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            outputs: list[tuple[dict[Path, Path], dict[str, str]]] = []
+            for name, line_ending in (("lf", "\n"), ("crlf", "\r\n")):
+                project = root / name
+                project.mkdir()
+                entry = project / "main.hl"
+                entry.write_bytes(source.replace("\n", line_ending).encode("utf-8"))
+                output_directory = project / "objects"
+                objects = build_project_objects(
+                    entry,
+                    output_directory,
+                    compiler=compiler,
+                )
+                manifest = json.loads(
+                    (output_directory / "aether-objects.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                hashes = {
+                    record["source"]: record["source_sha256"]
+                    for record in manifest["modules"]
+                }
+                outputs.append((objects, hashes))
+
+            lf_objects, lf_hashes = outputs[0]
+            crlf_objects, crlf_hashes = outputs[1]
+            self.assertEqual(lf_hashes, crlf_hashes)
+            self.assertEqual(
+                {
+                    source: object_path.read_bytes()
+                    for source, object_path in lf_objects.items()
+                },
+                {
+                    source: object_path.read_bytes()
+                    for source, object_path in crlf_objects.items()
+                },
+            )
+
+    def test_link_project_objects_rejects_incomplete_or_foreign_object_maps(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "lib.hl").write_text(
+                "fn value() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "lib.hl" as lib;\n'
+                "fn main() -> i32 { return lib::value(); }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            output = project / "invalid.exe"
+
+            with self.assertRaises(C99LinkConfigurationError):
+                link_project_objects(
+                    entry,
+                    {Path("main.hl"): objects[Path("main.hl")]},
+                    output,
+                    compiler=compiler,
+                )
+            with self.assertRaises(C99LinkConfigurationError):
+                link_project_objects(
+                    entry,
+                    {
+                        **objects,
+                        Path("other.hl"): objects[Path("lib.hl")],
+                    },
+                    output,
+                    compiler=compiler,
+                )
+
+            self.assertFalse(output.exists())
+
+    def test_link_project_objects_uses_explicit_ffi_libraries(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                '@ffi @link("native") extern "C" fn native_value() -> i32;\n'
+                "@ffi fn main() -> i32 { return native_value(); }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            library = project / "native.o"
+            compile_c99_object(
+                "int native_value(void) { return 37; }\n",
+                library,
+                compiler=compiler,
+            )
+            output = project / "linked.exe"
+            with self.assertRaises(C99LinkConfigurationError):
+                link_project_objects(
+                    entry,
+                    objects,
+                    output,
+                    compiler=compiler,
+                )
+            linked = link_project_objects(
+                entry,
+                objects,
+                output,
+                compiler=compiler,
+                libraries={"native": library},
+            )
+            execution = subprocess.run(
+                [str(linked)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            reference = run_project(
+                entry,
+                "main",
+                external_handlers={"native_value": lambda: 37},
+            )
+
+        self.assertEqual(execution.returncode, reference, execution.stderr)
+
+    def test_link_project_objects_preserves_output_on_link_error(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                '@ffi @link("native") extern "C" fn missing_symbol() -> i32;\n'
+                "@ffi fn main() -> i32 { return missing_symbol(); }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            library = project / "native.o"
+            compile_c99_object(
+                "int unrelated_symbol(void) { return 7; }\n",
+                library,
+                compiler=compiler,
+            )
+            output = project / "existing.exe"
+            output.write_bytes(b"previous executable")
+
+            with self.assertRaises(C99BuildError):
+                link_project_objects(
+                    entry,
+                    objects,
+                    output,
+                    compiler=compiler,
+                    libraries={"native": library},
+                )
+
+            self.assertEqual(output.read_bytes(), b"previous executable")
+
+    def test_link_project_objects_rejects_changed_source(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "lib.hl").write_text(
+                "fn value() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "lib.hl" as lib;\n'
+                "fn main() -> i32 { return lib::value(); }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            (project / "lib.hl").write_text(
+                "fn value() -> i32 { return 13; }\n",
+                encoding="utf-8",
+            )
+            output = project / "stale.exe"
+
+            with self.assertRaisesRegex(
+                C99LinkConfigurationError,
+                "has changed since its object was built",
+            ):
+                link_project_objects(
+                    entry,
+                    objects,
+                    output,
+                    compiler=compiler,
+                )
+
+            self.assertFalse(output.exists())
+
+    def test_link_project_objects_rejects_modified_object(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                "fn main() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            objects[Path("main.hl")].write_bytes(
+                objects[Path("main.hl")].read_bytes() + b"tampered"
+            )
+            output = project / "corrupt.exe"
+
+            with self.assertRaisesRegex(
+                C99LinkConfigurationError,
+                "has changed since its object was built",
+            ):
+                link_project_objects(
+                    entry,
+                    objects,
+                    output,
+                    compiler=compiler,
+                )
+
+            self.assertFalse(output.exists())
+
+    def test_link_project_objects_rejects_malformed_manifests(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "lib.hl").write_text(
+                "fn value() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "lib.hl" as lib;\n'
+                "fn main() -> i32 { return lib::value(); }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            manifest_path = project / "objects" / "aether-objects.json"
+            valid_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            output = project / "preserved.exe"
+            preserved_output = b"previous executable"
+
+            malformed_manifests = [
+                ("unsupported format", lambda value: value.update(format="other")),
+                ("legacy manifest version", lambda value: value.update(version=1)),
+                ("boolean version", lambda value: value.update(version=True)),
+                ("missing toolchain", lambda value: value.pop("toolchain")),
+                ("invalid toolchain", lambda value: value.update(toolchain=[])),
+                ("invalid entry path", lambda value: value.update(entry_source="./main.hl")),
+                ("invalid module list", lambda value: value.update(modules={})),
+                (
+                    "missing module",
+                    lambda value: value.update(modules=value["modules"][:1]),
+                ),
+                (
+                    "duplicate source",
+                    lambda value: value["modules"].append(
+                        dict(value["modules"][0])
+                    ),
+                ),
+                (
+                    "duplicate object",
+                    lambda value: value["modules"][1].update(
+                        object=value["modules"][0]["object"]
+                    ),
+                ),
+                (
+                    "traversal source",
+                    lambda value: value["modules"][0].update(source="../main.hl"),
+                ),
+                (
+                    "noncanonical source",
+                    lambda value: value["modules"][0].update(source="./main.hl"),
+                ),
+                (
+                    "traversal object",
+                    lambda value: value["modules"][0].update(object="../escape.o"),
+                ),
+                (
+                    "invalid digest",
+                    lambda value: value["modules"][0].update(source_sha256="g" * 64),
+                ),
+                (
+                    "missing digest",
+                    lambda value: value["modules"][0].pop("object_sha256"),
+                ),
+                ("non-object record", lambda value: value["modules"].__setitem__(0, None)),
+            ]
+            for label, mutate in malformed_manifests:
+                with self.subTest(manifest=label):
+                    mutated = json.loads(json.dumps(valid_manifest))
+                    mutate(mutated)
+                    manifest_path.write_text(
+                        json.dumps(mutated),
+                        encoding="utf-8",
+                    )
+                    output.write_bytes(preserved_output)
+
+                    with self.assertRaises(C99LinkConfigurationError):
+                        link_project_objects(
+                            entry,
+                            objects,
+                            output,
+                            compiler=compiler,
+                        )
+
+                    self.assertEqual(output.read_bytes(), preserved_output)
+
+            invalid_encodings = [
+                ("invalid json", b"{"),
+                ("invalid utf-8", b"\xff"),
+                (
+                    "duplicate json key",
+                    b'{"format":"aether-object-set","format":"aether-object-set"}',
+                ),
+            ]
+            for label, contents in invalid_encodings:
+                with self.subTest(manifest=label):
+                    manifest_path.write_bytes(contents)
+                    output.write_bytes(preserved_output)
+
+                    with self.assertRaises(C99LinkConfigurationError):
+                        link_project_objects(
+                            entry,
+                            objects,
+                            output,
+                            compiler=compiler,
+                        )
+
+                    self.assertEqual(output.read_bytes(), preserved_output)
+
+            manifest_path.unlink()
+            output.write_bytes(preserved_output)
+            with self.assertRaisesRegex(
+                C99LinkConfigurationError,
+                "Cannot read object manifest",
+            ):
+                link_project_objects(
+                    entry,
+                    objects,
+                    output,
+                    compiler=compiler,
+                )
+            self.assertEqual(output.read_bytes(), preserved_output)
+
+    def test_link_project_objects_normalizes_mapping_keys_and_rejects_collisions(
+        self,
+    ) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "lib.hl").write_text(
+                "fn value() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "lib.hl" as lib;\n'
+                "fn main() -> i32 { return lib::value(); }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            equivalent_mapping = {
+                ("./" + source.as_posix()): object_path
+                for source, object_path in objects.items()
+            }
+            output = project / "linked.exe"
+            link_project_objects(
+                entry,
+                equivalent_mapping,
+                output,
+                compiler=compiler,
+            )
+            self.assertTrue(output.is_file())
+
+            collision_mapping = dict(equivalent_mapping)
+            collision_mapping["main.hl"] = objects[Path("main.hl")]
+            with self.assertRaisesRegex(
+                C99LinkConfigurationError,
+                "Duplicate object mapping",
+            ):
+                link_project_objects(
+                    entry,
+                    collision_mapping,
+                    project / "collision.exe",
+                    compiler=compiler,
+                )
+
+            traversal_mapping = dict(equivalent_mapping)
+            traversal_mapping["..\\outside.hl"] = objects[Path("main.hl")]
+            with self.assertRaisesRegex(
+                C99LinkConfigurationError,
+                "project-relative source path",
+            ):
+                link_project_objects(
+                    entry,
+                    traversal_mapping,
+                    project / "traversal.exe",
+                    compiler=compiler,
+                )
+
+    def test_link_project_objects_wraps_missing_object_error(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                "fn main() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            objects[Path("main.hl")].unlink()
+            output = project / "preserved.exe"
+            output.write_bytes(b"previous executable")
+
+            with self.assertRaisesRegex(
+                C99LinkConfigurationError,
+                "Cannot read object file",
+            ):
+                link_project_objects(
+                    entry,
+                    objects,
+                    output,
+                    compiler=compiler,
+                )
+
+            self.assertEqual(output.read_bytes(), b"previous executable")
+
+    def test_project_object_link_rejects_toolchain_mismatches(self) -> None:
+        delegate = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                "fn main() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            wrapper, configuration_path = self.controllable_compiler(
+                project,
+                delegate,
+            )
+            baseline = {"version": "test cc 1.0", "target": "test-target-1"}
+
+            for label, change, expected_field in (
+                ("version", {"version": "test cc 2.0"}, "version"),
+                ("target", {"target": "test-target-2"}, "target"),
+                (
+                    "compiler command",
+                    {"command_argument": "alternate"},
+                    "command_sha256",
+                ),
+            ):
+                with self.subTest(mismatch=label):
+                    configuration_path.write_text(
+                        json.dumps(baseline),
+                        encoding="utf-8",
+                    )
+                    objects = build_project_objects(
+                        entry,
+                        project / f"objects-{label.replace(' ', '-')}",
+                        compiler=wrapper,
+                    )
+                    configuration_path.write_text(
+                        json.dumps(
+                            {
+                                **baseline,
+                                **{
+                                    key: value
+                                    for key, value in change.items()
+                                    if key != "command_argument"
+                                },
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    output = project / f"{label.replace(' ', '-')}.exe"
+                    output.write_bytes(b"previous executable")
+                    link_compiler = wrapper
+                    if "command_argument" in change:
+                        link_compiler = (*wrapper, change["command_argument"])
+
+                    with self.assertRaisesRegex(
+                        C99LinkConfigurationError,
+                        f"mismatched fields: {expected_field}",
+                    ):
+                        link_project_objects(
+                            entry,
+                            objects,
+                            output,
+                            compiler=link_compiler,
+                        )
+
+                    self.assertEqual(output.read_bytes(), b"previous executable")
+
+    def test_project_object_link_rejects_toolchain_flag_mismatch(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                "fn main() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=compiler,
+            )
+            output = project / "flags.exe"
+            output.write_bytes(b"previous executable")
+
+            with patch(
+                "src.build._C99_LINK_FLAGS",
+                ("-std=c99", "-pedantic", "-Werror", "-fno-common"),
+            ):
+                with self.assertRaisesRegex(
+                    C99LinkConfigurationError,
+                    "mismatched fields: link_flags",
+                ):
+                    link_project_objects(
+                        entry,
+                        objects,
+                        output,
+                        compiler=compiler,
+                    )
+
+            self.assertEqual(output.read_bytes(), b"previous executable")
+
+    def test_project_object_build_rejects_failed_toolchain_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                "fn main() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            wrapper, configuration_path = self.controllable_compiler(
+                project,
+                self.compiler(),
+            )
+            for label, identity, error_message in (
+                (
+                    "empty version",
+                    {"version": "", "target": "test-target"},
+                    "empty or oversized version",
+                ),
+                (
+                    "empty target",
+                    {"version": "test cc 1.0", "target": ""},
+                    "invalid target identity",
+                ),
+            ):
+                with self.subTest(probe=label):
+                    configuration_path.write_text(
+                        json.dumps(identity),
+                        encoding="utf-8",
+                    )
+                    output_directory = project / f"objects-{label.replace(' ', '-')}"
+
+                    with self.assertRaisesRegex(
+                        C99ToolchainError,
+                        error_message,
+                    ):
+                        build_project_objects(
+                            entry,
+                            output_directory,
+                            compiler=wrapper,
+                        )
+
+                    self.assertFalse(output_directory.exists())
+
+    def test_project_object_link_wraps_failed_toolchain_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                "fn main() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            wrapper, configuration_path = self.controllable_compiler(
+                project,
+                self.compiler(),
+            )
+            configuration_path.write_text(
+                json.dumps({"version": "test cc 1.0", "target": "test-target"}),
+                encoding="utf-8",
+            )
+            objects = build_project_objects(
+                entry,
+                project / "objects",
+                compiler=wrapper,
+            )
+            configuration_path.write_text(
+                json.dumps({"version": "", "target": "test-target"}),
+                encoding="utf-8",
+            )
+            output = project / "preserved.exe"
+            output.write_bytes(b"previous executable")
+
+            with self.assertRaisesRegex(
+                C99LinkConfigurationError,
+                "Cannot identify C99 toolchain",
+            ):
+                link_project_objects(
+                    entry,
+                    objects,
+                    output,
+                    compiler=wrapper,
+                )
+
+            self.assertEqual(output.read_bytes(), b"previous executable")
+
+    def test_build_project_objects_publishes_nothing_on_compiler_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "lib.hl").write_text(
+                "fn value() -> i32 { return 12; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "lib.hl" as lib;\n'
+                "fn main() -> i32 { return lib::value(); }\n",
+                encoding="utf-8",
+            )
+            call_count = project / "calls.txt"
+            fake_compiler = project / "fake_compiler.py"
+            fake_compiler.write_text(
+                "import pathlib, sys\n"
+                "if sys.argv[-1:] == ['--version']:\n"
+                "    print('fake compiler 1.0')\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[-1:] == ['-dumpmachine']:\n"
+                "    print('fake-target')\n"
+                "    raise SystemExit(0)\n"
+                f"count_path = pathlib.Path({str(call_count)!r})\n"
+                "count = int(count_path.read_text() if count_path.exists() else '0')\n"
+                "count_path.write_text(str(count + 1))\n"
+                "if count == 0:\n"
+                "    output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
+                "    output.write_bytes(b'fake object')\n"
+                "    raise SystemExit(0)\n"
+                "print('intentional compiler failure', file=sys.stderr)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            output_directory = project / "objects"
+
+            with self.assertRaises(C99BuildError):
+                build_project_objects(
+                    entry,
+                    output_directory,
+                    compiler=(sys.executable, str(fake_compiler)),
+                )
+
+            self.assertFalse(output_directory.exists())
+            self.assertEqual(call_count.read_text(encoding="utf-8"), "2")
+
+    def test_build_project_objects_rejects_existing_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                "fn main() -> i32 { return 0; }\n",
+                encoding="utf-8",
+            )
+            output_directory = project / "objects"
+            output_directory.mkdir()
+            marker = output_directory / "keep.txt"
+            marker.write_text("keep", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                build_project_objects(
+                    entry,
+                    output_directory,
+                    compiler=("missing-c-compiler",),
+                )
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_project_executable_preserves_artifact_when_module_link_fails(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            entry = project / "main.hl"
+            entry.write_text(
+                '@ffi @link("native") extern "C" fn missing_symbol() -> i32;\n'
+                "@ffi fn main() -> i32 { return missing_symbol(); }\n",
+                encoding="utf-8",
+            )
+            library_object = project / "native.o"
+            compile_c99_object(
+                "int unrelated_symbol(void) { return 7; }\n",
+                library_object,
+                compiler=compiler,
+            )
+            output = project / "existing.exe"
+            output.write_bytes(b"previous executable")
+
+            with self.assertRaises(C99BuildError):
+                build_project_executable(
+                    entry,
+                    output,
+                    compiler=compiler,
+                    libraries={"native": library_object},
+                )
+            self.assertEqual(output.read_bytes(), b"previous executable")
 
     def test_project_c99_rejects_features_outside_backend_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

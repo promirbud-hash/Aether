@@ -5,6 +5,7 @@ import unittest
 from src.ai_view import generate_ai_view
 from src.codemap import build_codemap, render_map
 from src.frontend import (
+    AssignmentStmt,
     FunctionDecl,
     LetStmt,
     ReturnStmt,
@@ -95,6 +96,17 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(addition.children[0].value, "*")
         self.assertEqual(result.diagnostics, ())
 
+    def test_var_rebinding_parses_and_renders_as_assignment(self) -> None:
+        source = "fn update() -> i32 { var value = 1; value = value + 1; return value; }\n"
+        result = parse_source(source)
+        function = result.ast.declarations[0]
+
+        self.assertEqual(result.diagnostics, ())
+        self.assertIsInstance(function.body[1], AssignmentStmt)
+        canonical = render_module(result.ast)
+        self.assertIn("value = value + 1;", canonical)
+        self.assertEqual(parse_source(canonical).diagnostics, ())
+
     def test_ast_rendering_is_parseable_and_view_generation_is_deterministic(self) -> None:
         first = parse_source(self.source)
         canonical = render_module(first.ast)
@@ -105,6 +117,24 @@ class FrontendTests(unittest.TestCase):
             generate_ai_view(first.ast),
             generate_ai_view(reparsed.ast),
         )
+
+    def test_unit_type_expressions_roundtrip_in_scalar_and_tensor_types(self) -> None:
+        source = (
+            "fn slope(value: Tensor<f32, [4], V/mm>) -> f32<V/mm> {\n"
+            "  return sum(value);\n"
+            "}\n"
+            "fn wavelength(value: f32<µm>) -> f32<um> { return value; }\n"
+            "fn inverse_time(value: f64<1/ms>) -> f64<kHz> { return value; }\n"
+        )
+        result = parse_source(source)
+        canonical = render_module(result.ast)
+
+        self.assertEqual(result.diagnostics, ())
+        self.assertIn("Tensor<f32,[4],V/mm>", canonical)
+        self.assertIn("-> f32<V/mm>", canonical)
+        self.assertEqual(parse_source(canonical).diagnostics, ())
+        codemap = render_map(build_codemap(result.ast))
+        self.assertIn("value:f32<um>", codemap)
 
     def test_codemap_from_ast_uses_declarations_and_calls(self) -> None:
         result = parse_source(self.source)
@@ -198,14 +228,36 @@ class FrontendTests(unittest.TestCase):
             "fn sample() -> i32 { return read(); }\n"
         )
         parsed = parse_source(source)
-        text = render_map(build_codemap(parsed.ast))
-        cst_text = render_map(build_codemap(parse_tokens(source, tokenize(source))))
+        ast_map = build_codemap(parsed.ast)
+        cst_map = build_codemap(parse_tokens(source, tokenize(source)))
+        text = render_map(ast_map)
+        cst_text = render_map(cst_map)
 
         self.assertEqual(parsed.diagnostics, ())
+        self.assertEqual(cst_map, ast_map)
         self.assertIn("X read", text)
         self.assertIn("C sample>read", text)
         self.assertIn("X read", cst_text)
         self.assertIn("C sample>read", cst_text)
+
+    def test_codemap_ast_and_cst_inputs_match_for_nested_calls_and_purity(self) -> None:
+        source = (
+            "fn helper(value: i32) -> i32 { return value; }\n"
+            "fn caller(value: i32) -> i32 {\n"
+            "  let nested = helper(value + helper(1));\n"
+            "  return helper(nested);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+
+        ast_map = build_codemap(parsed.ast)
+        cst_map = build_codemap(parse_tokens(source, tokenize(source)))
+        syntax_cst_map = build_codemap(parsed.cst)
+
+        self.assertEqual(cst_map, ast_map)
+        self.assertEqual(syntax_cst_map, ast_map)
+        self.assertEqual(render_map(cst_map), render_map(ast_map))
 
 
 if __name__ == "__main__":

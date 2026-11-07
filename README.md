@@ -94,12 +94,24 @@ Safe-C99 build path for projects. Imports use qualified names (`alias::function`
 and `alias::Type`) and reject cycles. Workspace/LSP import resolution is not
 yet supported. Import paths resolve from the importing file and must remain
 inside the entry file's directory; the same module may be imported through
-multiple distinct aliases.
+multiple distinct aliases. `build_project_object` emits one combined C
+translation unit, while `build_project_executable` compiles each source module
+separately and links the resulting objects. `build_project_objects` writes a
+separately linkable object per source module to a new output directory and
+returns a mapping from relative source paths to object paths;
+`link_project_objects` validates the generated manifest, source and object
+hashes against the current project before linking with explicitly configured
+FFI libraries.
 Unit conversions are explicit (`convert(value, "m")`) and are represented as
 rational scale/offset operations (plus a symbolic pi power for angular units)
 in semantic results and executed by the reference interpreter. Its typed IR
 preserves source spans, inferred expression types, effects, and conversion
 metadata.
+SI prefixes and compound unit expressions are supported in numeric and tensor
+type annotations, with exact rational scales and `µ` normalized to `u`.
+`convert` accepts the same compound expressions. The registry remains finite;
+see [`docs/unit-prefix-design.md`](docs/unit-prefix-design.md) and
+[`docs/aether-subset.md`](docs/aether-subset.md) for the supported subset.
 Absolute-temperature arithmetic is rejected rather than implicitly
 approximated. Effect annotations currently describe the effect contract
 checked against effects inferred from the built-ins `io_write`, `io_read_line`,
@@ -122,11 +134,29 @@ supported ABI types and current limitations are documented in
 `docs/aether-subset.md`.
 
 The experimental Safe-C99 backend is available as `emit_c99(source)` from
-`src.api`. It emits deterministic C99 for a checked scalar subset and rejects
-unsupported features with diagnostics. `build_object(source, output_path)`
-compiles that subset to a host object file. `build_executable(source,
-output_path)` links a program whose entry point is `fn main() -> i32` or
+`src.api`. It emits deterministic C99 for a checked scalar and static
+`f32`/`f64` tensor subset and rejects unsupported features with diagnostics.
+`build_object(source, output_path)` compiles that subset to a host object file.
+`build_executable(source, output_path)` links a program whose entry point is
+`fn main() -> i32` or
 `fn main() -> void`. Native C ABI calls require explicit `libraries` mappings
 from each `@link` name to a linker-compatible file. The build APIs do not
 dynamically load libraries or run generated programs. See
 `docs/aether-subset.md` for the supported operations and limitations.
+The consolidated roadmap, current milestone statuses, and next ownership
+gates are in [`docs/roadmap.md`](docs/roadmap.md).
+The scalar and bounded tensor reverse-mode
+`gradient(function_name, input)` intrinsic is implemented for the subset
+documented in [`docs/aether-subset.md`](docs/aether-subset.md).
+The memory/ownership baseline is accepted. Its bounded `FrameBuffer` ARC
+increment is implemented in the analyzer, typed IR, interpreter, and C99
+backend: one reference per owning binding, borrowed parameters, owned returns,
+explicit temporary lifetimes, and retain-before-release rebinding. General
+ARC, COW, arbitrary destructors, and ownership-bearing FFI remain out of scope.
+A bounded inline scalar `Result` subset and C99 `?` cleanup epilogue are
+implemented; the tensor autodiff tape has a narrow invocation-local allocation
+policy.
+See [`docs/autodiff-tensor-contract.md`](docs/autodiff-tensor-contract.md),
+[`docs/unit-prefix-design.md`](docs/unit-prefix-design.md), and
+[`docs/memory-ownership-design.md`](docs/memory-ownership-design.md) for their
+distinct statuses and limitations.

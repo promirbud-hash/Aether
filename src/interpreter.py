@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import math
 import re
+import struct
+import sys
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
@@ -33,6 +35,62 @@ class ResultValue:
 class Quantity:
     value: object
     type: AetherType
+
+
+@dataclass(frozen=True)
+class _ADValue:
+    values: tuple[float, ...]
+    nodes: tuple[int, ...]
+    is_tensor: bool
+
+
+@dataclass
+class _FrameStorage:
+    data: bytearray
+    refcount: int = 1
+
+
+class _FrameBuffer:
+    def __init__(
+        self,
+        data: bytearray,
+        *,
+        _storage: _FrameStorage | None = None,
+    ) -> None:
+        self._storage = _storage or _FrameStorage(data)
+        self._released = False
+
+    @property
+    def data(self) -> bytearray:
+        return self._storage.data
+
+    @property
+    def length(self) -> int:
+        return len(self._storage.data)
+
+    @property
+    def refcount(self) -> int:
+        return self._storage.refcount
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def retain(self) -> _FrameBuffer:
+        if self._released or self._storage.refcount < 1:
+            raise AetherRuntimeError("Cannot retain a released FrameBuffer")
+        if self._storage.refcount >= sys.maxsize:
+            raise AetherRuntimeError("FrameBuffer reference count overflow")
+        self._storage.refcount += 1
+        return _FrameBuffer(self.data, _storage=self._storage)
+
+    def release(self) -> None:
+        if self._released or self._storage.refcount < 1:
+            raise AetherRuntimeError("FrameBuffer released more than once")
+        self._released = True
+        self._storage.refcount -= 1
+        if self._storage.refcount == 0:
+            self._storage.data.clear()
 
 
 class AetherRuntimeError(RuntimeError):
@@ -100,6 +158,20 @@ def _flatten(value: object) -> list[object]:
     return [value]
 
 
+def _reshape_flat(values: list[float], shape: tuple[int, ...]) -> object:
+    cursor = 0
+
+    def build(axis: int) -> object:
+        nonlocal cursor
+        if axis == len(shape):
+            value = values[cursor]
+            cursor += 1
+            return value
+        return [build(axis + 1) for _ in range(shape[axis])]
+
+    return build(0)
+
+
 def _divide(left: object, right: object) -> object:
     if (
         isinstance(left, int)
@@ -121,6 +193,29 @@ def _remainder(left: object, right: object) -> object:
     ):
         return left - _divide(left, right) * right
     return left % right
+
+
+def _round_f32(value: object) -> float:
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return -math.inf if value < 0 else math.inf
+    try:
+        return struct.unpack("=f", struct.pack("=f", numeric))[0]
+    except OverflowError:
+        return math.copysign(math.inf, numeric)
+
+
+def _round_to_type(value: object, type_: AetherType | None) -> object:
+    if type_ is None:
+        return value
+    if type_.name == "Tensor":
+        element_type = type_.element_type
+        if element_type is not None:
+            return _map_unary(value, lambda item: _round_to_type(item, element_type))
+    if type_.name == "f32":
+        return _round_f32(value)
+    return value
 
 
 class Interpreter:
@@ -146,6 +241,9 @@ class Interpreter:
         self.external_handlers = dict(external_handlers or {})
         self.max_call_depth = max_call_depth
         self._call_depth = 0
+        self._frame_resources: list[list[object | None]] = []
+        self._frame_resource_slots: list[dict[str, int]] = []
+        self._temporary_resources: list[list[object]] = []
         self._functions = {function.name: function for function in module.functions}
         self._types = {type_.name: type_ for type_ in module.types}
 
@@ -227,6 +325,16 @@ class Interpreter:
             )
 
         self._call_depth += 1
+        frame_resources: list[object | None] = [
+            None for _ in function.frame_resources
+        ]
+        self._frame_resources.append(frame_resources)
+        self._frame_resource_slots.append(
+            {
+                name: index
+                for index, name in enumerate(function.frame_resources)
+            }
+        )
         try:
             try:
                 result, returned = self._execute_body(function, environment)
@@ -243,11 +351,7 @@ class Interpreter:
                         function.return_type,
                         function.name,
                     )
-                return self._prepare_output(
-                    result,
-                    function.return_type,
-                    function.name,
-                )
+                return self._prepare_output(result, function.return_type, function.name)
             if (
                 function.has_return_annotation
                 and function.return_type.name not in {"void", "Unknown"}
@@ -263,7 +367,78 @@ class Interpreter:
                 )
             return None
         finally:
+            for resource in reversed(frame_resources):
+                if resource is not None:
+                    self._release_owned_value(resource)
+            if self._frame_resources[-1] is not frame_resources:
+                raise AetherRuntimeError("Frame resource stack is corrupted")
+            self._frame_resources.pop()
+            self._frame_resource_slots.pop()
             self._call_depth -= 1
+
+    @staticmethod
+    def _contains_frame_buffer(type_: AetherType) -> bool:
+        return type_.name == "FrameBuffer" or any(
+            Interpreter._contains_frame_buffer(argument)
+            for argument in type_.arguments
+        )
+
+    @staticmethod
+    def _clone_owned_value(value: object) -> object:
+        if isinstance(value, _FrameBuffer):
+            return value.retain()
+        if isinstance(value, ResultValue) and value.is_ok:
+            payload = Interpreter._clone_owned_value(value.value)
+            if payload is not value.value:
+                return ResultValue.ok(payload)
+        return value
+
+    @staticmethod
+    def _release_owned_value(value: object) -> None:
+        if isinstance(value, _FrameBuffer):
+            value.release()
+        elif isinstance(value, ResultValue) and value.is_ok:
+            Interpreter._release_owned_value(value.value)
+
+    def _track_temporary(self, value: object) -> object:
+        if self._temporary_resources and self._owns_frame_buffer(value):
+            self._temporary_resources[-1].append(value)
+        return value
+
+    @staticmethod
+    def _owns_frame_buffer(value: object) -> bool:
+        return isinstance(value, _FrameBuffer) or (
+            isinstance(value, ResultValue)
+            and value.is_ok
+            and isinstance(value.value, _FrameBuffer)
+        )
+
+    def _evaluate_statement_expression(
+        self,
+        expression: IRExpression,
+        environment: dict[str, object],
+        *,
+        transfer: bool = False,
+    ) -> object:
+        temporaries: list[object] = []
+        self._temporary_resources.append(temporaries)
+        try:
+            value = self._evaluate(expression, environment)
+            if transfer and self._contains_frame_buffer(expression.type):
+                if expression.ownership == "borrowed":
+                    value = self._clone_owned_value(value)
+                else:
+                    for index in range(len(temporaries) - 1, -1, -1):
+                        if temporaries[index] is value:
+                            temporaries.pop(index)
+                            break
+            return value
+        finally:
+            if self._temporary_resources[-1] is not temporaries:
+                raise AetherRuntimeError("Temporary resource stack is corrupted")
+            for temporary in reversed(temporaries):
+                self._release_owned_value(temporary)
+            self._temporary_resources.pop()
 
     def _prepare_output(
         self,
@@ -288,6 +463,10 @@ class Interpreter:
     ) -> object:
         if type_.name == "Result":
             return self._prepare_result(value, type_, function, parameter)
+        if type_.name == "FrameBuffer":
+            if not isinstance(value, _FrameBuffer) or value.released:
+                raise TypeError(f"{function}.{parameter} expects a live FrameBuffer")
+            return value
         if type_.name == "void":
             if value is not None:
                 raise TypeError(f"{function}.{parameter} expects no value")
@@ -345,6 +524,7 @@ class Interpreter:
                         element_type,
                         f"{function}.{parameter}[{index}]",
                     )
+            raw = _round_to_type(raw, type_)
             if _has_unit(type_):
                 if isinstance(value, Quantity) and value.type != type_:
                     raise TypeError(
@@ -360,13 +540,13 @@ class Interpreter:
                         f"{function}.{parameter} expects unit {type_.unit_symbol or type_.unit}, "
                         f"got {value.type.unit_symbol or value.type.unit}"
                     )
-                return value
+                return Quantity(_round_to_type(raw, type_), type_)
             self._validate_scalar(raw, type_, f"{function}.{parameter}")
-            return Quantity(raw, type_)
+            return Quantity(_round_to_type(raw, type_), type_)
         if isinstance(value, Quantity):
             raise TypeError(f"{function}.{parameter} does not accept a unitful value")
         self._validate_scalar(raw, type_, f"{function}.{parameter}")
-        return raw
+        return _round_to_type(raw, type_)
 
     def _prepare_result(
         self,
@@ -420,19 +600,50 @@ class Interpreter:
         for statement in function.body:
             if statement.kind == "let":
                 assert statement.expression is not None
-                environment[statement.name] = self._evaluate(
-                    statement.expression, environment
+                value = self._evaluate_statement_expression(
+                    statement.expression,
+                    environment,
+                    transfer=True,
                 )
+                environment[statement.name] = value
+                if self._contains_frame_buffer(statement.expression.type):
+                    slot = self._frame_resource_slots[-1].get(statement.name)
+                    if slot is None:
+                        raise AetherRuntimeError(
+                            f"Missing ownership slot for {statement.name!r}"
+                        )
+                    self._frame_resources[-1][slot] = value
+            elif statement.kind == "assignment":
+                assert statement.expression is not None
+                value = self._evaluate_statement_expression(
+                    statement.expression,
+                    environment,
+                    transfer=True,
+                )
+                slot = self._frame_resource_slots[-1].get(statement.name)
+                if slot is not None:
+                    old_value = self._frame_resources[-1][slot]
+                    if old_value is not None:
+                        self._release_owned_value(old_value)
+                    self._frame_resources[-1][slot] = value
+                environment[statement.name] = value
             elif statement.kind == "expression":
                 assert statement.expression is not None
-                value = self._evaluate(statement.expression, environment)
+                value = self._evaluate_statement_expression(
+                    statement.expression,
+                    environment,
+                )
                 if isinstance(value, ResultValue):
                     raise AetherRuntimeError(
                         f"Discarded Result value at line {statement.span.line}"
                     )
             elif statement.kind == "return":
                 value = (
-                    self._evaluate(statement.expression, environment)
+                    self._evaluate_statement_expression(
+                        statement.expression,
+                        environment,
+                        transfer=True,
+                    )
                     if statement.expression is not None
                     else None
                 )
@@ -446,8 +657,11 @@ class Interpreter:
     ) -> object:
         kind = expression.kind
         if kind == "literal":
-            return self._literal(expression.value)
+            return _round_to_type(self._literal(expression.value), expression.type)
         if kind == "identifier":
+            error_codes = {"IoError": 1, "FsError": 2, "NetError": 3}
+            if expression.value in error_codes:
+                return error_codes[expression.value]
             try:
                 return environment[expression.value]
             except KeyError as error:
@@ -470,8 +684,10 @@ class Interpreter:
                     f"'?' expected Result at line {expression.span.line}"
                 )
             if not value.is_ok:
-                raise _PropagateResult(value)
-            return value.value
+                raise _PropagateResult(self._clone_owned_value(value))
+            return self._track_temporary(
+                self._clone_owned_value(value.value)
+            )
         if kind == "match":
             subject = self._evaluate(expression.children[0], environment)
             if not isinstance(subject, ResultValue):
@@ -491,6 +707,9 @@ class Interpreter:
             return self._evaluate(arm.value, scoped)
         if kind == "call":
             return self._evaluate_call(expression, environment)
+        if kind == "gradient":
+            input_value = self._evaluate(expression.children[0], environment)
+            return self._evaluate_gradient(expression, input_value)
         if kind == "binary":
             if expression.value == "|>":
                 left = self._evaluate(expression.children[0], environment)
@@ -541,6 +760,307 @@ class Interpreter:
             f"Unsupported IR expression {kind!r} at line {expression.span.line}"
         )
 
+    def _evaluate_gradient(
+        self,
+        expression: IRExpression,
+        input_value: object,
+    ) -> object:
+        target = self._functions.get(expression.value)
+        if target is None or len(target.parameters) != 1:
+            raise AetherRuntimeError(
+                f"Invalid autodiff target {expression.value!r} at line "
+                f"{expression.span.line}"
+            )
+        try:
+            prepared = self._prepare_input(
+                input_value,
+                target.parameters[0].type,
+                "gradient",
+                target.parameters[0].name,
+            )
+        except TypeError as error:
+            raise AetherRuntimeError(
+                f"Invalid autodiff input at line {expression.span.line}: {error}"
+            ) from error
+        if target.parameters[0].type.name == "Tensor":
+            return self._evaluate_tensor_gradient(expression, target, prepared)
+        if not isinstance(prepared, (int, float)) or isinstance(prepared, bool):
+            raise AetherRuntimeError(
+                f"Autodiff v0 requires a scalar input at line {expression.span.line}"
+            )
+
+        tape: list[tuple[float, tuple[tuple[int, float], ...]]] = [
+            (float(prepared), ())
+        ]
+        environment: dict[str, _ADValue] = {
+            target.parameters[0].name: _ADValue((float(prepared),), (0,), False)
+        }
+        returned: _ADValue | None = None
+        for statement in target.body:
+            if statement.kind == "let" and statement.expression is not None:
+                environment[statement.name] = self._trace_ad_expression(
+                    statement.expression,
+                    environment,
+                    tape,
+                )
+            elif statement.kind == "return" and statement.expression is not None:
+                returned = self._trace_ad_expression(
+                    statement.expression,
+                    environment,
+                    tape,
+                )
+                break
+            else:
+                raise AetherRuntimeError(
+                    f"Unsupported autodiff statement at line {statement.span.line}"
+                )
+        if returned is None:
+            raise AetherRuntimeError(
+                f"Autodiff target did not return at line {target.span.line}"
+            )
+
+        adjoints = [0.0] * len(tape)
+        if returned.is_tensor or len(returned.nodes) != 1:
+            raise AetherRuntimeError(
+                f"Scalar autodiff target returned a tensor at line {target.span.line}"
+            )
+        adjoints[returned.nodes[0]] = 1.0
+        for node_index in range(len(tape) - 1, -1, -1):
+            for parent, partial in tape[node_index][1]:
+                adjoints[parent] += adjoints[node_index] * partial
+        return self._wrap(adjoints[0], expression.type)
+
+    def _evaluate_tensor_gradient(
+        self,
+        expression: IRExpression,
+        target: IRFunction,
+        prepared: object,
+    ) -> object:
+        parameter_type = target.parameters[0].type
+        raw_input = prepared.value if isinstance(prepared, Quantity) else prepared
+        input_values = tuple(float(value) for value in _flatten(raw_input))
+        element_type = parameter_type.element_type
+        if element_type is not None:
+            input_values = tuple(
+                _round_to_type(value, element_type) for value in input_values
+            )
+        tape: list[tuple[float, tuple[tuple[int, float], ...]]] = [
+            (value, ()) for value in input_values
+        ]
+        environment: dict[str, _ADValue] = {
+            target.parameters[0].name: _ADValue(
+                input_values,
+                tuple(range(len(input_values))),
+                True,
+            )
+        }
+        returned: _ADValue | None = None
+        for statement in target.body:
+            if statement.kind == "let" and statement.expression is not None:
+                environment[statement.name] = self._trace_ad_expression(
+                    statement.expression,
+                    environment,
+                    tape,
+                )
+            elif statement.kind == "return" and statement.expression is not None:
+                returned = self._trace_ad_expression(
+                    statement.expression,
+                    environment,
+                    tape,
+                )
+                break
+            else:
+                raise AetherRuntimeError(
+                    f"Unsupported autodiff statement at line {statement.span.line}"
+                )
+        if returned is None or returned.is_tensor:
+            raise AetherRuntimeError(
+                f"Autodiff target did not return a scalar at line {target.span.line}"
+            )
+
+        adjoints = [0.0] * len(tape)
+        adjoints[returned.nodes[0]] = 1.0
+        for node_index in range(len(tape) - 1, -1, -1):
+            for parent, partial in tape[node_index][1]:
+                adjoints[parent] += adjoints[node_index] * partial
+        gradient = adjoints[:len(input_values)]
+        result = _reshape_flat(gradient, parameter_type.dimensions)
+        return self._wrap(result, expression.type)
+
+    def _trace_ad_expression(
+        self,
+        expression: IRExpression,
+        environment: dict[str, _ADValue],
+        tape: list[tuple[float, tuple[tuple[int, float], ...]]],
+    ) -> _ADValue:
+        kind = expression.kind
+        if kind == "literal":
+            value = _round_to_type(
+                float(self._literal(expression.value)),
+                expression.type,
+            )
+            tape.append((value, ()))
+            return _ADValue((value,), (len(tape) - 1,), False)
+        if kind == "identifier":
+            try:
+                return environment[expression.value]
+            except KeyError as error:
+                raise AetherRuntimeError(
+                    f"Unknown autodiff value {expression.value!r} "
+                    f"at line {expression.span.line}"
+                ) from error
+        if kind == "group":
+            return self._trace_ad_expression(
+                expression.children[0], environment, tape
+            )
+        if kind == "unary":
+            operand = self._trace_ad_expression(
+                expression.children[0], environment, tape
+            )
+            if expression.value == "+":
+                return operand
+            if expression.value == "-":
+                values: list[float] = []
+                nodes: list[int] = []
+                element_type = (
+                    expression.type.element_type
+                    if expression.type.name == "Tensor"
+                    else expression.type
+                )
+                for value, parent in zip(operand.values, operand.nodes):
+                    result = _round_to_type(-value, element_type)
+                    partial = _round_to_type(-1.0, element_type)
+                    tape.append((result, ((parent, partial),)))
+                    values.append(result)
+                    nodes.append(len(tape) - 1)
+                return _ADValue(tuple(values), tuple(nodes), operand.is_tensor)
+        if kind == "binary":
+            left = self._trace_ad_expression(
+                expression.children[0], environment, tape
+            )
+            right = self._trace_ad_expression(
+                expression.children[1], environment, tape
+            )
+            is_tensor = expression.type.name == "Tensor"
+            count = len(left.values) if left.is_tensor else len(right.values)
+            if left.is_tensor and right.is_tensor and len(left.values) != len(right.values):
+                raise AetherRuntimeError(
+                    f"Autodiff tensor shape mismatch at line {expression.span.line}"
+                )
+            left_values = left.values if left.is_tensor else left.values * count
+            right_values = right.values if right.is_tensor else right.values * count
+            left_nodes = left.nodes if left.is_tensor else left.nodes * count
+            right_nodes = right.nodes if right.is_tensor else right.nodes * count
+            values = []
+            nodes = []
+            element_type = (
+                expression.type.element_type
+                if expression.type.name == "Tensor"
+                else expression.type
+            )
+            for a, b, parent_a, parent_b in zip(
+                left_values, right_values, left_nodes, right_nodes
+            ):
+                if expression.value == "+":
+                    value, parents = a + b, ((parent_a, 1.0), (parent_b, 1.0))
+                elif expression.value == "-":
+                    value, parents = a - b, ((parent_a, 1.0), (parent_b, -1.0))
+                elif expression.value == "*":
+                    value, parents = a * b, ((parent_a, b), (parent_b, a))
+                elif expression.value == "/":
+                    if b == 0.0:
+                        raise AetherRuntimeError(
+                            f"Division by zero at line {expression.span.line}"
+                        )
+                    value = a / b
+                    parents = (
+                        (parent_a, 1.0 / b),
+                        (parent_b, -a / (b * b)),
+                    )
+                else:
+                    raise AetherRuntimeError(
+                        f"Unsupported autodiff operator at line {expression.span.line}"
+                    )
+                value = _round_to_type(value, element_type)
+                parents = tuple(
+                    (parent, _round_to_type(partial, element_type))
+                    for parent, partial in parents
+                )
+                tape.append((value, parents))
+                values.append(value)
+                nodes.append(len(tape) - 1)
+            return _ADValue(tuple(values), tuple(nodes), is_tensor)
+        if kind == "call":
+            callee = expression.children[0]
+            if callee.kind != "identifier":
+                raise AetherRuntimeError(
+                    f"Unsupported autodiff call at line {expression.span.line}"
+                )
+            if callee.value == "convert" and len(expression.children) == 3:
+                operand = self._trace_ad_expression(
+                    expression.children[1], environment, tape
+                )
+                conversion = expression.conversion
+                if (
+                    conversion is None
+                    or conversion.addend
+                    or conversion.pi_power
+                ):
+                    raise AetherRuntimeError(
+                        f"Nonlinear unit conversion in autodiff at line "
+                        f"{expression.span.line}"
+                    )
+                factor = float(conversion.multiplier)
+                element_type = (
+                    expression.type.element_type
+                    if expression.type.name == "Tensor"
+                    else expression.type
+                )
+                values = tuple(
+                    _round_to_type(
+                        value * factor + float(conversion.addend),
+                        element_type,
+                    )
+                    for value in operand.values
+                )
+                factor = _round_to_type(factor, element_type)
+                nodes = []
+                for value, parent in zip(values, operand.nodes):
+                    tape.append((value, ((parent, factor),)))
+                    nodes.append(len(tape) - 1)
+                return _ADValue(
+                    values,
+                    tuple(nodes),
+                    expression.type.name == "Tensor",
+                )
+            if callee.value not in {"sum", "mean"} or len(expression.children) != 2:
+                raise AetherRuntimeError(
+                    f"Unsupported autodiff call at line {expression.span.line}"
+                )
+            operand = self._trace_ad_expression(
+                expression.children[1], environment, tape
+            )
+            if not operand.is_tensor or not operand.values:
+                raise AetherRuntimeError(
+                    f"Autodiff reduction requires a non-empty tensor "
+                    f"at line {expression.span.line}"
+                )
+            element_type = expression.type
+            value = 0.0
+            for item in operand.values:
+                value = _round_to_type(value + item, element_type)
+            factor = 1.0
+            if callee.value == "mean":
+                factor = 1.0 / len(operand.values)
+                value = _round_to_type(value / len(operand.values), element_type)
+                factor = _round_to_type(factor, element_type)
+            parents = tuple((node, factor) for node in operand.nodes)
+            tape.append((value, parents))
+            return _ADValue((value,), (len(tape) - 1,), False)
+        raise AetherRuntimeError(
+            f"Unsupported autodiff expression {kind!r} at line {expression.span.line}"
+        )
+
     def _evaluate_pipeline_right(
         self,
         right: IRExpression,
@@ -585,8 +1105,37 @@ class Interpreter:
         arguments: list[object],
         expression: IRExpression,
     ) -> object:
+        if name == "frame_buffer" and len(arguments) == 1:
+            size = arguments[0]
+            if not isinstance(size, int) or isinstance(size, bool):
+                raise AetherRuntimeError("FrameBuffer size must be an integer")
+            if size <= 0 or size > sys.maxsize:
+                raise AetherRuntimeError(
+                    "FrameBuffer size is zero or exceeds the runtime allocation limit"
+                )
+            try:
+                resource = _FrameBuffer(bytearray(size))
+            except (MemoryError, OverflowError) as error:
+                raise AetherRuntimeError("FrameBuffer allocation failed") from error
+            return self._track_temporary(resource)
+        if name == "frame_buffer_len" and len(arguments) == 1:
+            resource = arguments[0]
+            if not isinstance(resource, _FrameBuffer) or resource.released:
+                raise AetherRuntimeError("Invalid or released FrameBuffer")
+            return resource.length
+        if name == "Ok" and len(arguments) == 1:
+            return self._track_temporary(
+                ResultValue.ok(self._clone_owned_value(arguments[0]))
+            )
+        if name == "Err" and len(arguments) == 1:
+            return ResultValue.err(arguments[0])
         if name in self._functions:
-            return self._call(self._functions[name], tuple(arguments), {})
+            result = self._call(self._functions[name], tuple(arguments), {})
+            return (
+                self._track_temporary(result)
+                if self._contains_frame_buffer(expression.type)
+                else result
+            )
         if name in self._EFFECTFUL_BUILTINS:
             if expression.type.name != "Result" or len(expression.type.arguments) != 2:
                 raise AetherRuntimeError(
@@ -640,9 +1189,20 @@ class Interpreter:
                     f"{name} cannot operate on an empty tensor at line {expression.span.line}"
                 )
             if name == "sum":
-                result = sum(items)
+                if expression.type.name == "f32":
+                    result = 0.0
+                    for item in items:
+                        result = _round_f32(result + item)
+                else:
+                    result = sum(items)
             elif name == "mean":
-                result = sum(items) / len(items)
+                if expression.type.name == "f32":
+                    result = 0.0
+                    for item in items:
+                        result = _round_f32(result + item)
+                    result = _round_f32(result / len(items))
+                else:
+                    result = sum(items) / len(items)
             else:
                 result = max(abs(item) for item in items)
             return self._wrap(result, expression.type)
@@ -739,6 +1299,7 @@ class Interpreter:
 
     @staticmethod
     def _wrap(value: object, type_: AetherType) -> object:
+        value = _round_to_type(value, type_)
         return Quantity(value, type_) if _has_unit(type_) else value
 
     @staticmethod

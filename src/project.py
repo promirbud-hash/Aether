@@ -8,6 +8,7 @@ import os
 from pathlib import Path, PureWindowsPath
 
 from src.frontend import (
+    AssignmentStmt,
     Diagnostic,
     Expr,
     ExprStmt,
@@ -38,6 +39,11 @@ class ProjectCompilationError(ValueError):
         )
 
 
+def _source_digest(source: str) -> str:
+    canonical_source = source.replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(canonical_source.encode("utf-8")).hexdigest()
+
+
 def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
     """Load a relative-import graph, resolve symbols, and lower it to one IR."""
     root = Path(entry_path).expanduser().resolve()
@@ -54,6 +60,7 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
         )
     diagnostics: list[Diagnostic] = []
     modules: dict[Path, Module] = {}
+    source_hashes: dict[Path, str] = {}
     states: dict[Path, str] = {}
     stack: list[Path] = []
 
@@ -85,6 +92,7 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
             stack.pop()
             states[path] = "loaded"
             return
+        source_hashes[path] = _source_digest(source)
         try:
             parsed = parse_source(source, source_path=str(path), validate=False)
         except ParseError as error:
@@ -259,9 +267,21 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
         def rewrite_expression(expression: Expr) -> Expr:
             if expression.kind == "call":
                 callee = resolve_callee(expression.children[0])
-                arguments = tuple(
-                    rewrite_expression(child) for child in expression.children[1:]
-                )
+                raw_arguments = expression.children[1:]
+                if (
+                    expression.children[0].kind == "identifier"
+                    and expression.children[0].value == "gradient"
+                    and raw_arguments
+                    and raw_arguments[0].kind in {"identifier", "qualified"}
+                ):
+                    arguments = (
+                        resolve_callee(raw_arguments[0]),
+                        *(rewrite_expression(child) for child in raw_arguments[1:]),
+                    )
+                else:
+                    arguments = tuple(
+                        rewrite_expression(child) for child in raw_arguments
+                    )
                 return replace(expression, children=(callee, *arguments))
             if expression.kind == "binary" and expression.value == "|>":
                 left, right = expression.children
@@ -326,6 +346,13 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
                             value=rewrite_expression(statement.value),
                         )
                     )
+                elif isinstance(statement, AssignmentStmt):
+                    rewritten_body.append(
+                        replace(
+                            statement,
+                            value=rewrite_expression(statement.value),
+                        )
+                    )
                 elif isinstance(statement, ReturnStmt):
                     rewritten_body.append(
                         replace(
@@ -378,7 +405,15 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
     if errors:
         raise ProjectCompilationError(errors)
     try:
-        return lower_module(combined, semantic_result)
+        ir_module = lower_module(combined, semantic_result)
+        return replace(
+            ir_module,
+            source_paths=tuple(str(path) for path in modules),
+            source_hashes=tuple(
+                (str(path), source_hashes[path])
+                for path in modules
+            ),
+        )
     except IRLoweringError as error:
         raise ProjectCompilationError(error.diagnostics) from error
 

@@ -37,7 +37,8 @@ _BINARY_PRECEDENCE = {
 _BUILTIN_CALLS = {
     "mean", "max_abs", "subtract", "scale", "abs", "min", "max", "sum", "len",
     "convert", "io_write", "io_read_line", "fs_read_text", "fs_write_text",
-    "fs_exists", "net_get", "net_post",
+    "fs_exists", "net_get", "net_post", "gradient", "frame_buffer",
+    "frame_buffer_len", "Ok", "Err",
 }
 _KNOWN_ATTRIBUTES = {
     "pure", "io", "net", "fs", "ffi", "link", "persist", "contract", "C", "target",
@@ -48,7 +49,7 @@ _BUILTIN_TYPES = {
     "u8", "u16", "u32", "u64", "u128",
     "f16", "bf16", "f32", "f64", "fp8", "i4", "t2",
     "Tensor", "Slice", "Pool", "Id", "Result",
-    "IoError", "FsError", "NetError",
+    "IoError", "FsError", "NetError", "FrameBuffer",
 }
 _UNIT_NAMES = {
     "mm", "cm", "m", "km", "um", "nm", "V", "mV", "uV", "A", "mA",
@@ -87,12 +88,22 @@ class Attribute:
 
 
 @dataclass(frozen=True)
+class UnitExpr:
+    kind: str
+    span: SourceSpan
+    value: str = ""
+    children: tuple[UnitExpr, ...] = ()
+    exponent: int = 1
+
+
+@dataclass(frozen=True)
 class TypeExpr:
     name: str
     arguments: tuple[TypeExpr, ...]
     dimensions: tuple[str, ...]
     span: SourceSpan
     qualifier: str | None = None
+    unit_expression: UnitExpr | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +147,13 @@ class LetStmt:
 
 
 @dataclass(frozen=True)
+class AssignmentStmt:
+    name: str
+    value: Expr
+    span: SourceSpan
+
+
+@dataclass(frozen=True)
 class ReturnStmt:
     value: Expr | None
     span: SourceSpan
@@ -147,7 +165,7 @@ class ExprStmt:
     span: SourceSpan
 
 
-Statement = LetStmt | ReturnStmt | ExprStmt
+Statement = LetStmt | AssignmentStmt | ReturnStmt | ExprStmt
 
 
 @dataclass(frozen=True)
@@ -468,12 +486,26 @@ class _FrontendParser:
             qualifier = name.value
             name = self.expect_identifier("Expected a type name after '::'")
         arguments: list[TypeExpr] = []
+        unit_expression = None
         end = name.end
         if self.match("<"):
-            while self.current().value not in {">", ""}:
+            if name.value == "Tensor":
                 arguments.append(self.parse_type())
-                if not self.match(","):
-                    break
+                self.expect(",", "Tensor type requires an element type and shape")
+                arguments.append(self.parse_type())
+                if self.match(","):
+                    unit_expression = self.parse_unit_expression()
+            elif name.value in {
+                "f16", "bf16", "f32", "f64", "fp8",
+                "i4", "i8", "i16", "i32", "i64", "i128",
+                "u8", "u16", "u32", "u64", "u128",
+            }:
+                unit_expression = self.parse_unit_expression()
+            else:
+                while self.current().value not in {">", ""}:
+                    arguments.append(self.parse_type())
+                    if not self.match(","):
+                        break
             end = self.expect(">", "Expected '>' after type arguments").end
         return TypeExpr(
             name.value,
@@ -481,7 +513,76 @@ class _FrontendParser:
             (),
             self.span(start_token.start, end),
             qualifier,
+            unit_expression,
         )
+
+    def parse_unit_expression(self) -> UnitExpr:
+        expression = self.parse_unit_product()
+        while self.current().value == "/":
+            operator = self.advance()
+            right = self.parse_unit_product()
+            expression = UnitExpr(
+                "divide",
+                self.span(expression.span.start, right.span.end),
+                children=(expression, right),
+            )
+        return expression
+
+    def parse_unit_product(self) -> UnitExpr:
+        expression = self.parse_unit_factor()
+        while self.current().value == "*":
+            operator = self.advance()
+            right = self.parse_unit_factor()
+            expression = UnitExpr(
+                "multiply",
+                self.span(expression.span.start, right.span.end),
+                children=(expression, right),
+            )
+        return expression
+
+    def parse_unit_factor(self) -> UnitExpr:
+        if self.match("("):
+            opening = self.tokens[self.position - 1]
+            expression = self.parse_unit_expression()
+            closing = self.expect(")", "Expected ')' in unit expression")
+            expression = UnitExpr(
+                "group",
+                self.span(opening.start, closing.end),
+                children=(expression,),
+            )
+        else:
+            if self.current().value == "1":
+                symbol = self.advance()
+                expression = UnitExpr(
+                    "dimensionless",
+                    self.span(symbol.start, symbol.end),
+                )
+            else:
+                symbol = self.expect_identifier("Expected a unit symbol")
+                expression = UnitExpr(
+                    "symbol",
+                    self.span(symbol.start, symbol.end),
+                    symbol.value,
+                )
+        if self.match("^"):
+            exponent_token = self.current()
+            sign = -1 if self.match("-") else 1
+            if sign == 1:
+                self.match("+")
+            exponent = self.current()
+            if exponent.kind != "NUMBER" or not exponent.value.isdecimal():
+                raise _SyntaxError(
+                    "Unit exponent must be a signed integer",
+                    exponent_token,
+                )
+            self.advance()
+            expression = UnitExpr(
+                "power",
+                self.span(expression.span.start, exponent.end),
+                exponent=sign * int(exponent.value),
+                children=(expression,),
+            )
+        return expression
 
     def parse_block(self) -> tuple[tuple[Statement, ...], int]:
         self.expect("{", "Expected a function body")
@@ -508,6 +609,19 @@ class _FrontendParser:
 
     def parse_statement(self) -> Statement:
         token = self.current()
+        if (
+            token.kind == "IDENTIFIER"
+            and self.position + 1 < len(self.tokens)
+            and self.tokens[self.position + 1].value == "="
+        ):
+            name = self.advance()
+            self.advance()
+            value = self.parse_expression()
+            return AssignmentStmt(
+                name.value,
+                value,
+                self.span(name.start, value.span.end),
+            )
         if token.value in {"let", "var", "const"}:
             start = self.advance()
             name = self.expect_identifier("Expected a binding name")
@@ -827,10 +941,10 @@ def _analyze(module: Module, parser: _FrontendParser) -> None:
             locals_.add(parameter.name)
 
         for statement in declaration.body:
-            expression = (
-                statement.value if isinstance(statement, (LetStmt, ReturnStmt))
-                else statement.expression
-            )
+            if isinstance(statement, (LetStmt, AssignmentStmt, ReturnStmt)):
+                expression = statement.value
+            else:
+                expression = statement.expression
             if expression is not None:
                 _analyze_expression(
                     expression,
@@ -881,6 +995,24 @@ def _analyze_type(
         )
     for argument in type_expr.arguments:
         _analyze_type(argument, declared_types, diagnostics)
+    if type_expr.unit_expression is not None:
+        _analyze_unit_expression_names(type_expr.unit_expression, diagnostics)
+
+
+def _analyze_unit_expression_names(
+    expression: UnitExpr,
+    diagnostics: list[Diagnostic],
+) -> None:
+    if expression.kind == "symbol" and not expression.value:
+        diagnostics.append(
+            Diagnostic(
+                "E_UNIT_EXPRESSION",
+                "Expected a unit symbol",
+                expression.span,
+            )
+        )
+    for child in expression.children:
+        _analyze_unit_expression_names(child, diagnostics)
 
 
 def _analyze_expression(
@@ -914,8 +1046,16 @@ def _analyze_expression(
             )
         elif callee.kind != "identifier":
             _analyze_expression(callee, locals_, functions, diagnostics)
-        for argument in expression.children[1:]:
-            _analyze_expression(argument, locals_, functions, diagnostics)
+        for index, argument in enumerate(expression.children[1:]):
+            is_error_marker = (
+                callee.kind == "identifier"
+                and callee.value == "Err"
+                and index == 0
+                and argument.kind == "identifier"
+                and argument.value in {"IoError", "FsError", "NetError"}
+            )
+            if not is_error_marker:
+                _analyze_expression(argument, locals_, functions, diagnostics)
         return
     if expression.kind == "member":
         _analyze_expression(expression.children[0], locals_, functions, diagnostics)
@@ -944,12 +1084,46 @@ def _render_type(type_expr: TypeExpr) -> str:
         if type_expr.qualifier
         else type_expr.name
     )
+    if type_expr.name == "Tensor" and len(type_expr.arguments) == 2:
+        unit = (
+            "," + _render_unit_expression(type_expr.unit_expression)
+            if type_expr.unit_expression is not None
+            else ""
+        )
+        return (
+            f"{name}<"
+            + ",".join(_render_type(argument) for argument in type_expr.arguments)
+            + unit
+            + ">"
+        )
+    if type_expr.unit_expression is not None:
+        return f"{name}<{_render_unit_expression(type_expr.unit_expression)}>"
     if type_expr.arguments:
         return f"{name}<" + ",".join(
             _render_type(argument) for argument in type_expr.arguments
         ) + ">"
     return name
 
+
+def _render_unit_expression(expression: UnitExpr) -> str:
+    if expression.kind == "symbol":
+        return expression.value
+    if expression.kind == "dimensionless":
+        return "1"
+    if expression.kind == "group":
+        return "(" + _render_unit_expression(expression.children[0]) + ")"
+    if expression.kind == "power":
+        return (
+            _render_unit_expression(expression.children[0])
+            + "^"
+            + str(expression.exponent)
+        )
+    operator = "*" if expression.kind == "multiply" else "/"
+    return (
+        _render_unit_expression(expression.children[0])
+        + operator
+        + _render_unit_expression(expression.children[1])
+    )
 
 def _render_expression(expression: Expr, parent_precedence: int = 0) -> str:
     if expression.kind in {"identifier", "literal"}:
@@ -1059,6 +1233,10 @@ def render_module(module: Module) -> str:
                     f"{statement.binding_kind} {statement.name}{annotation} = "
                     f"{_render_expression(statement.value)};"
                 )
+            elif isinstance(statement, AssignmentStmt):
+                rendered = (
+                    f"{statement.name} = {_render_expression(statement.value)};"
+                )
             elif isinstance(statement, ReturnStmt):
                 rendered = "return"
                 if statement.value is not None:
@@ -1094,6 +1272,15 @@ def parse_source(
         parser.diagnostics.extend(analyze(ast).diagnostics)
     cst = _build_syntax_cst(source, ast, parser.lexical_cst)
     return FrontendResult(cst, ast, tuple(parser.diagnostics))
+
+
+def parse_unit_expression_text(source: str) -> UnitExpr:
+    """Parse one standalone unit expression for APIs that accept unit strings."""
+    parser = _FrontendParser(source)
+    expression = parser.parse_unit_expression()
+    if parser.current().kind != "EOF":
+        raise ValueError(f"Unexpected token {parser.current().value!r} in unit expression")
+    return expression
 
 
 def parse_source_file(path: str | Path, *, encoding: str = "utf-8") -> FrontendResult:

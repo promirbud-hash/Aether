@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -11,9 +13,28 @@ import tempfile
 from typing import Mapping, Sequence
 
 
-_C99_FLAGS = ("-std=c99", "-pedantic", "-Wall", "-Wextra", "-Werror", "-c")
-_C99_LINK_FLAGS = ("-std=c99", "-pedantic", "-Wall", "-Wextra", "-Werror")
+_C99_FLAGS = (
+    "-std=c99",
+    "-pedantic",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-ffp-contract=off",
+    "-frandom-seed=aether",
+    "-c",
+)
+_C99_LINK_FLAGS = (
+    "-std=c99",
+    "-pedantic",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-ffp-contract=off",
+    "-frandom-seed=aether",
+)
 _COMPILER_TIMEOUT_SECONDS = 120
+_COMPILER_PROBE_TIMEOUT_SECONDS = 10
+_MAX_COMPILER_VERSION_LENGTH = 16_384
 
 
 class C99ToolchainError(RuntimeError):
@@ -64,11 +85,84 @@ def _resolve_compiler(
         raise ValueError("compiler must be a non-empty command")
 
     executable = command[0]
-    if not Path(executable).is_file() and shutil.which(executable) is None:
+    resolved_executable = (
+        Path(executable).expanduser().resolve()
+        if Path(executable).expanduser().is_file()
+        else shutil.which(executable)
+    )
+    if resolved_executable is None:
         raise C99ToolchainError(
             f"C99 compiler executable {executable!r} was not found"
         )
-    return command
+    return (str(Path(resolved_executable).resolve()), *command[1:])
+
+
+def c99_toolchain_fingerprint(
+    compiler: str | os.PathLike[str] | Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Return stable compiler, target, and flag metadata for object manifests."""
+    command_prefix = _resolve_compiler(compiler)
+
+    def probe(argument: str, *, require_single_line: bool = False) -> str:
+        command = (*command_prefix, argument)
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                check=False,
+                timeout=_COMPILER_PROBE_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise C99ToolchainError(
+                f"Unable to identify C99 compiler using "
+                f"{subprocess.list2cmdline(command)}: {error}"
+            ) from error
+        if result.returncode != 0:
+            details = result.stderr.strip() or result.stdout.strip()
+            raise C99ToolchainError(
+                f"C99 compiler identity probe failed for "
+                f"{subprocess.list2cmdline(command)}"
+                + (f": {details}" if details else "")
+            )
+        output = result.stdout.strip()
+        if argument == "--version":
+            output = "\n".join(
+                part.strip()
+                for part in (result.stdout, result.stderr)
+                if part.strip()
+            )
+            if not output or len(output) > _MAX_COMPILER_VERSION_LENGTH:
+                raise C99ToolchainError(
+                    "C99 compiler returned an empty or oversized version string"
+                )
+        elif require_single_line:
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if len(lines) != 1:
+                raise C99ToolchainError(
+                    "C99 compiler returned an invalid target identity"
+                )
+            output = lines[0]
+        if not output:
+            raise C99ToolchainError(
+                f"C99 compiler returned no output for {argument!r}"
+            )
+        return output
+
+    command_digest = hashlib.sha256(
+        json.dumps(command_prefix, ensure_ascii=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return {
+        "executable": command_prefix[0],
+        "command_sha256": command_digest,
+        "version": probe("--version"),
+        "target": probe("-dumpmachine", require_single_line=True),
+        "compile_flags": list(_C99_FLAGS),
+        "link_flags": list(_C99_LINK_FLAGS),
+    }
 
 
 def compile_c99_object(
@@ -97,7 +191,7 @@ def compile_c99_object(
         command = (
             *command_prefix,
             *_C99_FLAGS,
-            str(source_file),
+            source_file.name,
             "-o",
             str(temporary_object),
         )
@@ -147,6 +241,49 @@ def compile_c99_object(
     return output
 
 
+def compile_c99_sources_to_objects(
+    c_sources: Mapping[str, str],
+    output_directory: str | os.PathLike[str],
+    *,
+    compiler: str | os.PathLike[str] | Sequence[str] | None = None,
+) -> dict[str, Path]:
+    """Compile named C99 sources and atomically publish their object directory."""
+    if not c_sources:
+        raise ValueError("at least one C source file is required")
+    output = Path(output_directory).expanduser().resolve()
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"Object output directory already exists: {output}")
+
+    source_names = tuple(sorted(c_sources))
+    for name in source_names:
+        relative = Path(name)
+        if (
+            not name
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.name in {"", ".", ".."}
+        ):
+            raise ValueError(f"Object file name must be a safe relative path: {name!r}")
+
+    command_prefix = _resolve_compiler(compiler)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".aether-objects-",
+        dir=output.parent,
+    ) as temporary_directory:
+        staging = Path(temporary_directory) / "objects"
+        staging.mkdir()
+        for name in source_names:
+            compile_c99_object(
+                c_sources[name],
+                staging / name,
+                compiler=command_prefix,
+            )
+        os.rename(staging, output)
+
+    return {name: output / name for name in source_names}
+
+
 def link_c99_executable(
     c_source: str,
     output_path: str | os.PathLike[str],
@@ -154,8 +291,88 @@ def link_c99_executable(
     compiler: str | os.PathLike[str] | Sequence[str] | None = None,
     libraries: Mapping[str, str | os.PathLike[str]] | None = None,
 ) -> Path:
-    """Compile and link C99 with explicitly named native-library files."""
+    """Compile and link one C99 translation unit with explicit libraries."""
+    return link_c99_executable_sources(
+        (c_source,),
+        output_path,
+        compiler=compiler,
+        libraries=libraries,
+    )
+
+
+def link_c99_executable_sources(
+    c_sources: Sequence[str],
+    output_path: str | os.PathLike[str],
+    *,
+    compiler: str | os.PathLike[str] | Sequence[str] | None = None,
+    libraries: Mapping[str, str | os.PathLike[str]] | None = None,
+) -> Path:
+    """Compile separate C99 translation units and link them atomically."""
+    if not c_sources:
+        raise ValueError("at least one C source file is required")
     command_prefix = _resolve_compiler(compiler)
+    output = Path(output_path).expanduser().resolve()
+    library_paths = {
+        Path(path).expanduser().resolve()
+        for path in (libraries or {}).values()
+    }
+    if output in library_paths:
+        raise C99LinkConfigurationError(
+            "Executable output path cannot overwrite an input library"
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(
+        prefix=".aether-c99-",
+        dir=output.parent,
+    ) as temporary_directory:
+        temporary = Path(temporary_directory)
+        temporary_executable = temporary / (
+            "module.exe" if os.name == "nt" else "module"
+        )
+        object_files = []
+        for index, c_source in enumerate(c_sources):
+            object_path = temporary / f"module_{index}.o"
+            compile_c99_object(
+                c_source,
+                object_path,
+                compiler=command_prefix,
+            )
+            object_files.append(object_path)
+        link_c99_objects(
+            object_files,
+            temporary_executable,
+            compiler=command_prefix,
+            libraries=libraries,
+        )
+        if not temporary_executable.is_file():
+            raise C99ToolchainError(
+                "C compiler reported success but did not produce an executable"
+            )
+        os.replace(temporary_executable, output)
+    return output
+
+
+def link_c99_objects(
+    object_files: Sequence[str | os.PathLike[str]],
+    output_path: str | os.PathLike[str],
+    *,
+    compiler: str | os.PathLike[str] | Sequence[str] | None = None,
+    libraries: Mapping[str, str | os.PathLike[str]] | None = None,
+) -> Path:
+    """Link existing object files and explicitly named native libraries."""
+    if not object_files:
+        raise ValueError("at least one object file is required")
+    command_prefix = _resolve_compiler(compiler)
+    objects = tuple(Path(path).expanduser().resolve() for path in object_files)
+    if len(set(objects)) != len(objects):
+        raise C99LinkConfigurationError("Object file inputs must be unique")
+    for path in objects:
+        if not path.is_file():
+            raise C99LinkConfigurationError(
+                f"Object file does not exist: {path}"
+            )
+
     library_paths: list[Path] = []
     for name, library_path in sorted((libraries or {}).items()):
         if not name or Path(name).name != name:
@@ -168,27 +385,25 @@ def link_c99_executable(
                 f"Library {name!r} does not resolve to a file: {path}"
             )
         library_paths.append(path)
+
     output = Path(output_path).expanduser().resolve()
-    if output in library_paths:
+    if output in (*objects, *library_paths):
         raise C99LinkConfigurationError(
-            "Executable output path cannot overwrite an input library"
+            "Executable output path cannot overwrite an input object or library"
         )
     output.parent.mkdir(parents=True, exist_ok=True)
-
     with tempfile.TemporaryDirectory(
-        prefix=".aether-c99-",
+        prefix=".aether-link-",
         dir=output.parent,
     ) as temporary_directory:
         temporary = Path(temporary_directory)
-        source_file = temporary / "module.c"
         temporary_executable = temporary / (
             "module.exe" if os.name == "nt" else "module"
         )
-        source_file.write_text(c_source, encoding="utf-8", newline="\n")
         command = (
             *command_prefix,
             *_C99_LINK_FLAGS,
-            str(source_file),
+            *(str(path) for path in objects),
             *(str(path) for path in library_paths),
             "-o",
             str(temporary_executable),

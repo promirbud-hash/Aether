@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.frontend import (
+    AssignmentStmt,
     Expr,
     FunctionDecl,
     LetStmt,
@@ -13,9 +14,11 @@ from src.frontend import (
     ReturnStmt,
     TypeDecl,
     TypeExpr,
+    UnitExpr,
+    parse_source,
     parse_source_file,
 )
-from src.parser import CSTNode
+from src.parser import CSTNode, ParseError
 
 
 _TRIVIA = {"WHITESPACE", "NEWLINE", "COMMENT"}
@@ -88,7 +91,7 @@ def _units(node: CSTNode) -> tuple[str, ...]:
     return tuple(sorted(set(_identifiers(node)) & _UNITS))
 
 
-def build_codemap(tree: CSTNode | Module) -> CodeMap:
+def _build_codemap_from_cst(tree: CSTNode | Module) -> CodeMap:
     """Extract function/type declarations, permissions, units, and call edges."""
     if isinstance(tree, Module):
         return _build_ast_codemap(tree)
@@ -276,11 +279,50 @@ def build_codemap(tree: CSTNode | Module) -> CodeMap:
 def _type_text(type_expr: TypeExpr) -> str:
     if type_expr.name == "[]":
         return "[" + ",".join(type_expr.dimensions) + "]"
+    if type_expr.name == "Tensor" and len(type_expr.arguments) == 2:
+        unit = (
+            "," + _unit_expression_text(type_expr.unit_expression)
+            if type_expr.unit_expression is not None
+            else ""
+        )
+        return (
+            f"{type_expr.name}<"
+            + ",".join(_type_text(argument) for argument in type_expr.arguments)
+            + unit
+            + ">"
+        )
+    if type_expr.unit_expression is not None:
+        return (
+            f"{type_expr.name}<"
+            + _unit_expression_text(type_expr.unit_expression)
+            + ">"
+        )
     if type_expr.arguments:
         return f"{type_expr.name}<" + ",".join(
             _type_text(argument) for argument in type_expr.arguments
         ) + ">"
     return type_expr.name
+
+
+def _unit_expression_text(expression: UnitExpr) -> str:
+    if expression.kind == "symbol":
+        return expression.value.replace("µ", "u")
+    if expression.kind == "dimensionless":
+        return "1"
+    if expression.kind == "group":
+        return "(" + _unit_expression_text(expression.children[0]) + ")"
+    if expression.kind == "power":
+        return (
+            _unit_expression_text(expression.children[0])
+            + "^"
+            + str(expression.exponent)
+        )
+    operator = "*" if expression.kind == "multiply" else "/"
+    return (
+        _unit_expression_text(expression.children[0])
+        + operator
+        + _unit_expression_text(expression.children[1])
+    )
 
 
 def _type_names(type_expr: TypeExpr) -> set[str]:
@@ -291,7 +333,17 @@ def _type_names(type_expr: TypeExpr) -> set[str]:
 
 
 def _type_units(type_expr: TypeExpr) -> set[str]:
-    return _type_names(type_expr) & _UNITS
+    units = _type_names(type_expr) & _UNITS
+    if type_expr.unit_expression is not None:
+        units.update(_unit_expression_names(type_expr.unit_expression))
+    return units
+
+
+def _unit_expression_names(expression: UnitExpr) -> set[str]:
+    names = {expression.value.replace("µ", "u")} if expression.kind == "symbol" else set()
+    for child in expression.children:
+        names.update(_unit_expression_names(child))
+    return names
 
 
 def _expression_nodes(expression: Expr):
@@ -303,7 +355,7 @@ def _expression_nodes(expression: Expr):
 
 
 def _statement_expression(statement):
-    if isinstance(statement, LetStmt):
+    if isinstance(statement, (LetStmt, AssignmentStmt)):
         return statement.value
     if isinstance(statement, ReturnStmt):
         return statement.value
@@ -445,6 +497,23 @@ def _calls(node: CSTNode) -> set[str]:
         ):
             calls.add(token.value)
     return calls
+
+
+def _source_text(node: CSTNode) -> str:
+    if node.is_leaf:
+        return node.value
+    return "".join(_source_text(child) for child in node.children)
+
+
+def build_codemap(tree: CSTNode | Module) -> CodeMap:
+    """Build the same codemap from concrete syntax and AST inputs."""
+    if isinstance(tree, Module):
+        return _build_ast_codemap(tree)
+    try:
+        module = parse_source(_source_text(tree), validate=False).ast
+    except ParseError:
+        return _build_codemap_from_cst(tree)
+    return _build_ast_codemap(module)
 
 
 def render_map(code_map: CodeMap) -> str:
