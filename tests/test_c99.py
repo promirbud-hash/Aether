@@ -784,7 +784,10 @@ int main(void) {
         self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
         source_path = directory / "generated.c"
         executable_path = directory / "generated"
-        source_path.write_text(prefix + generated + "\n" + harness, encoding="utf-8")
+        source_path.write_text(
+            prefix + generated + "\n" + harness + "\n",
+            encoding="utf-8",
+        )
         result = subprocess.run(
             [
                 *self.compiler(),

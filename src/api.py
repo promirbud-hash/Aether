@@ -376,8 +376,15 @@ def link_project_objects(
     }
     supplied_objects: dict[str, Path] = {}
     for source_path, object_path in object_paths.items():
-        relative = Path(source_path)
-        if relative.is_absolute() or ".." in relative.parts:
+        source_key = os.fspath(source_path)
+        windows_relative = PureWindowsPath(source_key)
+        relative = Path(source_key.replace("\\", "/"))
+        if (
+            relative.is_absolute()
+            or windows_relative.is_absolute()
+            or windows_relative.drive
+            or ".." in relative.parts
+        ):
             raise C99LinkConfigurationError(
                 f"Object mapping key must be a project-relative source path: {source_path!r}"
             )
