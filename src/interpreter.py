@@ -901,6 +901,22 @@ class Interpreter:
         tape: list[tuple[float, tuple[tuple[int, float], ...]]],
     ) -> _ADValue:
         kind = expression.kind
+        if kind == "binary" and expression.value == "|>":
+            left, right = expression.children
+            if right.kind == "call" and right.children:
+                callee = right.children[0]
+                arguments = (left, *right.children[1:])
+            else:
+                callee = right
+                arguments = (left,)
+            call = IRExpression(
+                "call",
+                expression.span,
+                expression.type,
+                children=(callee, *arguments),
+                conversion=right.conversion or expression.conversion,
+            )
+            return self._trace_ad_expression(call, environment, tape)
         if kind == "literal":
             value = _round_to_type(
                 float(self._literal(expression.value)),
@@ -1003,21 +1019,34 @@ class Interpreter:
                 raise AetherRuntimeError(
                     f"Unsupported autodiff call at line {expression.span.line}"
                 )
+            if callee.value in {"scale", "subtract"}:
+                if len(expression.children) != 3:
+                    raise AetherRuntimeError(
+                        f"Autodiff call {callee.value!r} requires two arguments "
+                        f"at line {expression.span.line}"
+                    )
+                binary = IRExpression(
+                    "binary",
+                    expression.span,
+                    expression.type,
+                    "*" if callee.value == "scale" else "-",
+                    children=expression.children[1:],
+                )
+                return self._trace_ad_expression(binary, environment, tape)
             if callee.value == "convert" and len(expression.children) == 3:
                 operand = self._trace_ad_expression(
                     expression.children[1], environment, tape
                 )
                 conversion = expression.conversion
-                if (
-                    conversion is None
-                    or conversion.addend
-                    or conversion.pi_power
-                ):
+                if conversion is None:
                     raise AetherRuntimeError(
-                        f"Nonlinear unit conversion in autodiff at line "
+                        f"Missing unit conversion in autodiff at line "
                         f"{expression.span.line}"
                     )
-                factor = float(conversion.multiplier)
+                factor = (
+                    float(conversion.multiplier)
+                    * math.pi ** conversion.pi_power
+                )
                 element_type = (
                     expression.type.element_type
                     if expression.type.name == "Tensor"

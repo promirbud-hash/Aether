@@ -1128,6 +1128,317 @@ class InterpreterTests(unittest.TestCase):
                 self.assertAlmostEqual(value, 0.0, delta=1e-12)
         self.assertEqual(interpreter.run("single_gradient", [42.0]), [1.0])
 
+    def test_f64_rank2_autodiff_preserves_rectangular_tensor_shape(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 3]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 3]>) "
+            "-> Tensor<f64, [2, 3]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        values = [[1.0, 2.0, 3.0], [4.0, 5.0, 7.0]]
+        gradient = run_source(source, "derivative", values)
+
+        self.assertEqual([len(row) for row in gradient], [3, 3])
+        for row in gradient:
+            for value in row:
+                self.assertAlmostEqual(value, 22.0 / 3.0, delta=1e-14)
+
+    def test_f64_rank3_autodiff_broadcasts_shared_reduction_gradient(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+            "fn reverse_objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(average * values);\n"
+            "}\n"
+            "fn reverse_derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(reverse_objective, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+        cases = (
+            ([[[1.0, 2.0]], [[3.0, 6.0]]], 6.0),
+            ([[[1e16, -1e16]], [[1.0, 3.0]]], 2.0),
+        )
+
+        for values, expected in cases:
+            with self.subTest(values=values):
+                self.assertEqual(
+                    interpreter.run("derivative", values),
+                    [[[expected, expected]], [[expected, expected]]],
+                )
+                self.assertEqual(
+                    interpreter.run("reverse_derivative", values),
+                    [[[expected, expected]], [[expected, expected]]],
+                )
+
+    def test_f64_rank3_autodiff_with_non_singleton_dimensions(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 2, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 2, 2]>) "
+            "-> Tensor<f64, [2, 2, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+        cases = (
+            ([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]], 9.0),
+            (
+                [
+                    [[1e16, -1e16], [1.0, 3.0]],
+                    [[1e16, -1e16], [1.0, 3.0]],
+                ],
+                2.0,
+            ),
+        )
+
+        for values, expected in cases:
+            with self.subTest(values=values):
+                result = interpreter.run("derivative", values)
+                self.assertEqual(
+                    result,
+                    [[[expected, expected], [expected, expected]]] * 2,
+                )
+
+    def test_f64_rank3_autodiff_with_uneven_inner_dimension(self) -> None:
+        source = (
+            "fn sum_objective(values: Tensor<f64, [2, 3, 2]>) -> f64 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn sum_gradient(values: Tensor<f64, [2, 3, 2]>) "
+            "-> Tensor<f64, [2, 3, 2]> {\n"
+            "  return gradient(sum_objective, values);\n"
+            "}\n"
+            "fn mean_objective(values: Tensor<f64, [2, 3, 2]>) -> f64 {\n"
+            "  return mean(values);\n"
+            "}\n"
+            "fn mean_gradient(values: Tensor<f64, [2, 3, 2]>) "
+            "-> Tensor<f64, [2, 3, 2]> {\n"
+            "  return gradient(mean_objective, values);\n"
+            "}\n"
+            "fn objective(values: Tensor<f64, [2, 3, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 3, 2]>) "
+            "-> Tensor<f64, [2, 3, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+        cases = (
+            (
+                [
+                    [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+                    [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
+                ],
+                13.0,
+            ),
+            (
+                [
+                    [
+                        [1e16, -1e16],
+                        [1e16, -1e16],
+                        [1e16, -1e16],
+                    ],
+                    [[1.0, 3.0], [1.0, 3.0], [1.0, 3.0]],
+                ],
+                2.0,
+            ),
+        )
+
+        for values, expected in cases:
+            with self.subTest(values=values):
+                ones = [[[1.0, 1.0] for _ in range(3)] for _ in range(2)]
+                self.assertEqual(interpreter.run("sum_gradient", values), ones)
+                for plane in interpreter.run("mean_gradient", values):
+                    for row in plane:
+                        for item in row:
+                            self.assertAlmostEqual(item, 1.0 / 12.0, delta=1e-15)
+                result = interpreter.run("derivative", values)
+                self.assertEqual(
+                    result,
+                    [[[expected, expected] for _ in range(3)] for _ in range(2)],
+                )
+
+    def test_f32_rank3_autodiff_with_uneven_inner_dimension(self) -> None:
+        source = (
+            "fn sum_objective(values: Tensor<f32, [2, 3, 2]>) -> f32 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn sum_gradient(values: Tensor<f32, [2, 3, 2]>) "
+            "-> Tensor<f32, [2, 3, 2]> {\n"
+            "  return gradient(sum_objective, values);\n"
+            "}\n"
+            "fn mean_objective(values: Tensor<f32, [2, 3, 2]>) -> f32 {\n"
+            "  return mean(values);\n"
+            "}\n"
+            "fn mean_gradient(values: Tensor<f32, [2, 3, 2]>) "
+            "-> Tensor<f32, [2, 3, 2]> {\n"
+            "  return gradient(mean_objective, values);\n"
+            "}\n"
+            "fn objective(values: Tensor<f32, [2, 3, 2]>) -> f32 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f32, [2, 3, 2]>) "
+            "-> Tensor<f32, [2, 3, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+        values = [
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+            [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
+        ]
+
+        expected_sum = [[[1.0, 1.0] for _ in range(3)] for _ in range(2)]
+        expected_product = [[[13.0, 13.0] for _ in range(3)] for _ in range(2)]
+        self.assertEqual(interpreter.run("sum_gradient", values), expected_sum)
+        mean_gradient = interpreter.run("mean_gradient", values)
+        for plane in mean_gradient:
+            for row in plane:
+                for item in row:
+                    self.assertAlmostEqual(item, 1.0 / 12.0, delta=1e-8)
+        self.assertEqual(
+            interpreter.run("derivative", values),
+            expected_product,
+        )
+
+    def test_f64_rank3_autodiff_sums_broadcast_adjoint(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  return sum(values + mean(values));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+
+        for values in (
+            [[[1.0, 2.0]], [[3.0, 6.0]]],
+            [[[1e16, -1e16]], [[1.0, 3.0]]],
+        ):
+            with self.subTest(values=values):
+                self.assertEqual(
+                    interpreter.run("derivative", values),
+                    [[[2.0, 2.0]], [[2.0, 2.0]]],
+                )
+
+    def test_f64_rank3_autodiff_negates_broadcast_mean_gradient(self) -> None:
+        source = (
+            "fn neg_mean(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  return sum(values + (-mean(values)));\n"
+            "}\n"
+            "fn neg_mean_gradient(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(neg_mean, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+
+        for values in (
+            [[[1.0, 2.0]], [[3.0, 6.0]]],
+            [[[1e16, -1e16]], [[1.0, 3.0]]],
+        ):
+            with self.subTest(values=values):
+                self.assertEqual(
+                    interpreter.run("neg_mean_gradient", values),
+                    [[[0.0, 0.0]], [[0.0, 0.0]]],
+                )
+
+    def test_f64_rank3_autodiff_broadcast_subtraction_gradients(self) -> None:
+        source = (
+            "fn tensor_minus_scalar(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values - average);\n"
+            "}\n"
+            "fn tensor_minus_scalar_gradient(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(tensor_minus_scalar, values);\n"
+            "}\n"
+            "fn scalar_minus_tensor(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(average - values);\n"
+            "}\n"
+            "fn scalar_minus_tensor_gradient(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(scalar_minus_tensor, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+
+        for values in (
+            [[[1.0, 2.0]], [[3.0, 6.0]]],
+            [[[1e16, -1e16]], [[1.0, 3.0]]],
+        ):
+            with self.subTest(values=values):
+                self.assertEqual(
+                    interpreter.run("tensor_minus_scalar_gradient", values),
+                    [[[0.0, 0.0]], [[0.0, 0.0]]],
+                )
+                self.assertEqual(
+                    interpreter.run("scalar_minus_tensor_gradient", values),
+                    [[[0.0, 0.0]], [[0.0, 0.0]]],
+                )
+
+    def test_f64_rank3_autodiff_division_gradient(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values / (average + average * average));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+        cases = (
+            ([[[1.0, 3.0]], [[5.0, 7.0]]], -1.0 / 25.0),
+            ([[[1e16, -1e16]], [[1.0, 3.0]]], -0.25),
+        )
+
+        for values, expected in cases:
+            with self.subTest(values=values):
+                result = interpreter.run("derivative", values)
+                for plane in result:
+                    for row in plane:
+                        for value in row:
+                            self.assertAlmostEqual(value, expected, delta=1e-12)
+
     def test_f64_autodiff_reductions_follow_sequential_sum_order(self) -> None:
         parsed = parse_source(
             "fn sum_objective(values: Tensor<f64, [2, 2]>) -> f64 {\n"
@@ -1172,6 +1483,34 @@ class InterpreterTests(unittest.TestCase):
                     interpreter.run("shared_gradient", values),
                     shared_expected,
                 )
+
+    def test_f64_autodiff_tensor_division_gradients(self) -> None:
+        parsed = parse_source(
+            "fn objective(values: Tensor<f64, [2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values / (average + average * average));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2]>) -> Tensor<f64, [2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+        cases = (
+            ([1.0, 3.0], -1.0 / 9.0),
+            ([-0.5, -0.5], -4.0),
+            ([1e-10, 1e-10], -1.0 / (1.0 + 1e-10) ** 2),
+        )
+
+        for values, analytic in cases:
+            with self.subTest(values=values):
+                actual = interpreter.run("derivative", values)
+                for actual_value in actual:
+                    self.assertAlmostEqual(
+                        actual_value,
+                        analytic,
+                        delta=max(abs(analytic) * 1e-9, 1e-12),
+                    )
 
     def test_f32_mean_gradient_rounds_local_derivative_factor(self) -> None:
         parsed = parse_source(
@@ -1218,10 +1557,31 @@ class InterpreterTests(unittest.TestCase):
         with self.assertRaisesRegex(AetherRuntimeError, "Division by zero"):
             run_source(source, "derivative", [1.0, 2.0])
 
+    def test_f64_tensor_reverse_mode_gradient_rejects_division_by_zero(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2]>) -> f64 {\n"
+            "  return sum(values / mean(values));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2]>) -> Tensor<f64, [2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        with self.assertRaisesRegex(AetherRuntimeError, "Division by zero"):
+            run_source(source, "derivative", [0.0, 0.0])
+
     def test_reverse_mode_gradient_propagates_division_by_zero(self) -> None:
         source = (
             "fn objective(x: f32) -> f32 { return x / x; }\n"
             "fn derivative(x: f32) -> f32 { return gradient(objective, x); }\n"
+        )
+
+        with self.assertRaisesRegex(AetherRuntimeError, "Division by zero"):
+            run_source(source, "derivative", 0.0)
+
+    def test_f64_reverse_mode_gradient_propagates_division_by_zero(self) -> None:
+        source = (
+            "fn objective(x: f64) -> f64 { return x / x; }\n"
+            "fn derivative(x: f64) -> f64 { return gradient(objective, x); }\n"
         )
 
         with self.assertRaisesRegex(AetherRuntimeError, "Division by zero"):

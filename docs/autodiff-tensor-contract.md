@@ -23,9 +23,9 @@ Tensor<T, S, U_in> -> Scalar<T, U_out>
 ```
 
 where `T` is exactly `f32` or `f64`, and `S` is a non-empty, statically known
-shape. The objective returns one scalar, not a tensor. The input and output
-may carry supported **linear** physical units. Affine absolute-temperature and
-angle units are excluded. Effects, control flow, nested user-function calls,
+shape. The objective returns one scalar, not a tensor. Input and output units
+may be linear, affine-temperature, or angular units when their ratio has a
+valid unit representation. Effects, control flow, nested user-function calls,
 and implicit conversions are excluded.
 
 The input expression must have exactly the objective's tensor element type and
@@ -37,10 +37,11 @@ Scalar and tensor gradients share expression tracing for the operations each
 overload accepts; scalar type and unit restrictions are unchanged.
 
 The gradient result has the same row-major shape and element type as the input.
-Its unit dimensions and exact rational scale are `unit(output) / unit(input)`.
-The prototype accepts explicit linear `convert` operations in the objective
-and differentiates their scale factor; affine offsets and symbolic pi
-conversions are excluded.
+Its unit dimensions, rational scale, and symbolic pi power are the quotient
+`unit(output) / unit(input)`; affine offsets do not contribute to the
+derivative. Explicit `convert` operations, including affine-temperature and
+angular conversions, are supported and differentiated by their multiplier
+including any power of pi.
 
 `Scalar<T, U_out>` and the tensor unit argument above are explanatory
 notation, not literal Aether type constructors. Numeric scalar types and the
@@ -60,7 +61,10 @@ contract:
   broadcasting forms.
 - Tensor/scalar `*` and tensor/scalar `/`, plus scalar/tensor `*`.
 - `sum(tensor)` and `mean(tensor)`, each reducing all elements to one scalar.
-- Explicit linear `convert(value, "unit")` with zero offset and no pi factor.
+- Explicit `convert(value, "unit")`, including affine offsets and symbolic pi
+  factors.
+- Built-in `scale(tensor, scalar)` and `subtract(tensor, tensor)`, including
+  their pipeline forms.
 
 Tensor/tensor multiplication and division remain unsupported. Indexing and
 all other calls are rejected in v0. In particular, `abs`, `min`, `max`, and
@@ -124,14 +128,38 @@ operations, rounding modes, or compiler targets. Differential tests
 cover cancellation-sensitive scalar and tensor adjoint accumulation, including
 retaining a unit residual between cancelling contributions of magnitude
 `2^24`, exact full cancellation, and graphs with multiple cancellation paths
-in different orders. They also cover tensor and scalar division gradients with
-positive, negative, and small nonzero denominators, a shared branch near the
+in different orders. `f64` quotient-gradient tests cover positive, negative,
+and small nonzero denominators, comparing analytic results across the
+interpreter, GCC, and Clang. Scalar and tensor `f64` gradients also verify
+that division by zero raises in the interpreter and traps in native C99.
+Rank-three `f64` gradients check scalar broadcasting through a shared `mean`
+value for addition, both subtraction operand orders, multiplication, and
+division. Multiplication is tested with both tensor/scalar operand orders;
+unary negation also checks the sign of a broadcast reduction adjoint. The
+cases include reduction and sign of broadcast adjoints and
+cancellation-sensitive row-major inputs. `[2,2,2]` and `[2,3,2]` cases
+complement `[2,1,2]` to check rank-three tensors without singleton dimensions
+and with an uneven inner dimension. Results are compared with analytic results
+in the interpreter and native C99. A corresponding `f32` `[2,3,2]` gradient
+case checks that both implementations preserve the expected `13.0` result
+across the non-singleton shape. The uneven-shape cases also batch direct
+`sum` and `mean` gradients to verify the unit and reciprocal-element-count
+adjoints for both precisions. A rectangular `f64` `[2,3]` case compares the
+interpreter and C99 gradients for a shared mean reduction and checks that the
+returned nested result preserves both dimensions.
+A rectangular `f32` `[2,3]` shared-mean product and an `f64` `[2,1,2,2]`
+shared-mean division cover rank/type combinations missing from the prior
+matrix; both are checked against analytic results in the interpreter and
+compiled C99.
+Other tests cover tensor and scalar division gradients, a shared branch near the
 `f32` integer precision boundary, subnormal scalar and tensor gradients, and
 gradients that overflow to positive infinity. Coverage includes a shared
 scaled tensor value used by both `sum` and `mean` and explicit linear unit
 conversion. These selected cases are checked against analytic results under
-GCC and Clang. Other `f32` inputs may still differ in least-significant bits
-across operations or compiler targets.
+GCC and Clang. Conversion tests also cover affine-temperature and angular
+conversion derivatives in the interpreter and native C99. Other `f32` inputs
+may still differ in least-significant bits across operations or compiler
+targets.
 
 ## Runtime and diagnostic behavior
 
@@ -139,8 +167,8 @@ across operations or compiler targets.
   no fallback derivative is synthesized.
 - A tensor input with the wrong runtime shape or element type is rejected
   consistently with the existing function-boundary checks.
-- Unit mismatches, unsupported affine units, or unit expressions that cannot
-  be represented are rejected; no unit is silently discarded.
+- Unit mismatches or unit ratios that cannot be represented are rejected; no
+  unit is silently discarded.
 - The objective's scalar result must have an explicit `f32` or `f64`
   annotation. Its unit is included in the derivative type.
 - Division by zero follows the current tensor runtime contract: interpreter
@@ -183,9 +211,9 @@ For finite values, the intended result is element-wise `2 * values`.
 
 ## Explicitly deferred
 
-Tensor-valued objectives and Jacobians, affine-temperature and angular
-differentiation, indexing, nonsmooth operations, control flow, dynamic shapes,
-higher-order differentiation, fusion, and CUDA are outside v0. Linear units
-are supported for the implemented subset using the separate unit-expression
-system. No production memory-safety or allocation guarantee follows from this
-prototype.
+Tensor-valued objectives and Jacobians, indexing, nonsmooth operations,
+control flow, dynamic shapes, higher-order differentiation, fusion, and CUDA
+are outside v0. Linear units and explicit affine-temperature and angular
+conversions are supported for the implemented subset using the separate
+unit-expression system. No production memory-safety or allocation guarantee
+follows from this prototype.

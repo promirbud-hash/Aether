@@ -58,6 +58,51 @@ class ProjectTests(unittest.TestCase):
         )
         self.assertTrue(any(statement.kind == "assignment" for statement in imported_update.body))
 
+    def test_project_unit_emission_applies_tensor_fusion(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "helper.hl").write_text(
+                "fn chain(values: Tensor<f32, [2]>, offset: f32) "
+                "-> Tensor<f32, [2]> {\n"
+                "    let scaled = values * 2.0;\n"
+                "    let shifted = scaled + offset;\n"
+                "    return shifted - values;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "helper.hl" as helper;\n'
+                "fn main() -> i32 { return 0; }\n",
+                encoding="utf-8",
+            )
+
+            module = compile_project(entry)
+            optimized_units = emit_c99_module_units(module, str(entry.resolve()))
+            baseline_units = emit_c99_module_units(
+                module,
+                str(entry.resolve()),
+                optimize=False,
+            )
+            optimized_helper = next(
+                unit for path, unit in optimized_units
+                if path == "helper.hl"
+            )
+            baseline_helper = next(
+                unit for path, unit in baseline_units
+                if path == "helper.hl"
+            )
+            self.assertEqual(optimized_helper.count("for (size_t aether_i_"), 1)
+            self.assertEqual(baseline_helper.count("for (size_t aether_i_"), 3)
+            self.assertEqual(len(optimized_units), len(baseline_units))
+            object_file = build_project_object(
+                entry,
+                project / "fusion.o",
+                compiler=compiler,
+            )
+            self.assertTrue(object_file.is_file())
+
     def compiler(self) -> tuple[str, ...]:
         configured_compiler = os.environ.get("AETHER_C99_COMPILER")
         if configured_compiler:
@@ -1361,6 +1406,44 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(diagnostic.code, "E_PROJECT_IO")
         self.assertEqual(diagnostic.span.source_path, str(entry.resolve()))
         self.assertIn("main.hl:", str(raised.exception))
+
+    def test_project_rejects_reserved_and_unsupported_types_in_imported_modules(self) -> None:
+        cases = (
+            (
+                "type i32 { value: i32, }\n"
+                "fn echo(value: i32) -> i32 { return value; }\n",
+                "E_RESERVED_TYPE",
+            ),
+            (
+                "type Nested { value: Result<Id, IoError>, }\n"
+                "fn accept(value: char) {}\n",
+                "E_UNSUPPORTED_TYPE",
+            ),
+        )
+        for library_source, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    project = Path(temporary_directory)
+                    library = project / "types.hl"
+                    library.write_text(library_source, encoding="utf-8")
+                    entry = project / "main.hl"
+                    entry.write_text(
+                        'import "types.hl" as types;\n'
+                        "fn main() -> i32 { return 0; }\n",
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaises(CompilationError) as raised:
+                        compile_project(entry)
+
+                matching = [
+                    diagnostic for diagnostic in raised.exception.diagnostics
+                    if diagnostic.code == expected_code
+                ]
+                self.assertTrue(matching)
+                self.assertTrue(
+                    all(item.span.source_path == str(library.resolve()) for item in matching)
+                )
 
     def test_project_rejects_import_paths_outside_entry_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

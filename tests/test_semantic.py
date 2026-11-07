@@ -43,6 +43,44 @@ class SemanticTests(unittest.TestCase):
         }
         self.assertEqual(reserved_names, _BUILTIN_CALLS)
 
+    def test_user_types_cannot_shadow_builtins(self) -> None:
+        result = parse_source(
+            "type i32 { value: i32, }\n"
+            "fn echo(value: i32) -> i32 { return value; }\n"
+        )
+
+        reserved = [
+            item for item in result.diagnostics if item.code == "E_RESERVED_TYPE"
+        ]
+        self.assertEqual(len(reserved), 1)
+        self.assertIn("'i32'", reserved[0].message)
+        with self.assertRaises(CompilationError):
+            compile_source(
+                "type i32 { value: i32, }\n"
+                "fn echo(value: i32) -> i32 { return value; }\n"
+            )
+
+    def test_unimplemented_builtin_types_are_rejected(self) -> None:
+        result = parse_source(
+            "type HasPool { value: Pool, }\n"
+            "type NestedId { value: Result<Id, IoError>, }\n"
+            "fn takes_char(value: char) {}\n"
+            "fn returns_slice() -> Slice<i32> { return 1; }\n"
+        )
+
+        unsupported = [
+            item for item in result.diagnostics
+            if item.code == "E_UNSUPPORTED_TYPE"
+        ]
+        self.assertEqual(len(unsupported), 4)
+        with self.assertRaises(CompilationError):
+            compile_source(
+                "type HasPool { value: Pool, }\n"
+                "type NestedId { value: Result<Id, IoError>, }\n"
+                "fn takes_char(value: char) {}\n"
+                "fn returns_slice() -> Slice<i32> { return 1; }\n"
+            )
+
     def test_frame_buffer_is_local_owned_and_cleaned(self) -> None:
         valid = parse_source(
             "fn inspect(size: u64) -> u64 {\n"
@@ -857,33 +895,36 @@ class SemanticTests(unittest.TestCase):
         self.assertEqual(inferred.unit_scale, Fraction(100))
         self.assertEqual(inferred.unit_symbol, "m/cm")
 
-    def test_tensor_autodiff_v0_rejects_nonlinear_units_and_shape_mismatches(self) -> None:
-        cases = (
-            (
-                "fn objective(x: Tensor<f32, [2], degC>) -> f32<V> "
-                "{ return sum(x); }\n"
-                "fn caller(x: Tensor<f32, [2], degC>) "
-                "-> Tensor<f32, [2], V/degC> { return gradient(objective, x); }\n",
-                "E_GRADIENT_UNIT",
-            ),
-            (
-                "fn objective(x: Tensor<f32, [2], rad>) -> f32<rad> "
-                "{ return sum(x); }\n"
-                "fn caller(x: Tensor<f32, [2], rad>) "
-                "-> Tensor<f32, [2]> { return gradient(objective, x); }\n",
-                "E_GRADIENT_UNIT",
-            ),
-            (
-                "fn objective(x: Tensor<f32, [2]>) -> f32 { return sum(x); }\n"
-                "fn caller(x: Tensor<f32, [3]>) "
-                "-> Tensor<f32, [3]> { return gradient(objective, x); }\n",
-                "E_GRADIENT_TYPE",
-            ),
+    def test_tensor_autodiff_accepts_affine_angular_units_and_rejects_shape_mismatches(self) -> None:
+        supported = (
+            "fn objective(x: Tensor<f32, [2], degC>) -> f32<K> {\n"
+            "  return sum(convert(x, \"K\"));\n"
+            "}\n"
+            "fn caller(x: Tensor<f32, [2], degC>) "
+            "-> Tensor<f32, [2]> { return gradient(objective, x); }\n"
         )
-        for source, expected in cases:
-            with self.subTest(expected=expected):
-                result = parse_source(source)
-                self.assertIn(expected, [item.code for item in result.diagnostics])
+        self.assertEqual(parse_source(supported).diagnostics, ())
+
+        angular = (
+            "fn objective(x: Tensor<f32, [2], deg>) -> f32<rad> {\n"
+            "  return sum(convert(x, \"rad\"));\n"
+            "}\n"
+            "fn caller(x: Tensor<f32, [2], deg>) "
+            "-> Tensor<f32, [2], rad/deg> {\n"
+            "  return gradient(objective, x);\n"
+            "}\n"
+        )
+        self.assertEqual(parse_source(angular).diagnostics, ())
+
+        mismatched_shape = parse_source(
+            "fn objective(x: Tensor<f32, [2]>) -> f32 { return sum(x); }\n"
+            "fn caller(x: Tensor<f32, [3]>) "
+            "-> Tensor<f32, [3]> { return gradient(objective, x); }\n"
+        )
+        self.assertIn(
+            "E_GRADIENT_TYPE",
+            [diagnostic.code for diagnostic in mismatched_shape.diagnostics],
+        )
 
 
 if __name__ == "__main__":

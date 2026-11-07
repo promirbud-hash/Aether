@@ -145,9 +145,15 @@ dynamically load libraries or run generated programs. See
 `docs/aether-subset.md` for the supported operations and limitations.
 The consolidated roadmap, current milestone statuses, and next ownership
 gates are in [`docs/roadmap.md`](docs/roadmap.md).
+The product-facing transition plan from prototype to a supportable release is
+in [`docs/roadmap_v2.md`](docs/roadmap_v2.md).
 The scalar and bounded tensor reverse-mode
 `gradient(function_name, input)` intrinsic is implemented for the subset
 documented in [`docs/aether-subset.md`](docs/aether-subset.md).
+An experimental, opt-in CUDA `.cu` emitter supports a narrow unitless `f32`
+elementwise tensor subset; its generated host wrapper requires an accessible
+CUDA device and never falls back to CPU. See
+[`docs/cuda-backend-design.md`](docs/cuda-backend-design.md).
 The memory/ownership baseline is accepted. Its bounded `FrameBuffer` ARC
 increment is implemented in the analyzer, typed IR, interpreter, and C99
 backend: one reference per owning binding, borrowed parameters, owned returns,

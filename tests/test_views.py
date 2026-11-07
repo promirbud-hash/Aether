@@ -158,6 +158,22 @@ class ViewTests(unittest.TestCase):
         self.assertIn("Z=|>", view)
         self.assertLess(len(encoder.encode(view)), len(encoder.encode("a |> a |> a |> a |> a |> a")))
 
+    def test_ai_view_spacing_uses_aliased_token_classes(self) -> None:
+        profile = TokenizerProfile(
+            name="class-changing-alias",
+            backend="tiktoken",
+            tokenizer="unused",
+            operator_aliases={"|>": ("pipeword",)},
+            idiom_aliases={},
+            semantic_aliases={},
+            alias_candidates=("$1",),
+        )
+        tree = parse("left |> right")
+
+        view = generate_ai_view(tree, profile)
+
+        self.assertIn("left pipeword right", view)
+
     def test_benchmark_runs_independent_tokenizer_profiles(self) -> None:
         profiles = load_profiles()
 

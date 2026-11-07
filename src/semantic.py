@@ -20,6 +20,7 @@ from src.frontend import (
     TypeExpr,
     UnitExpr,
     _BUILTIN_CALLS,
+    _BUILTIN_TYPES,
     parse_unit_expression_text,
 )
 
@@ -34,6 +35,7 @@ _INTEGER_TYPES = {
     "u8", "u16", "u32", "u64", "u128", "usize",
 }
 _FLOAT_TYPES = {"f16", "bf16", "f32", "f64", "fp8"}
+_UNSUPPORTED_BUILTIN_TYPES = {"char", "Slice", "Pool", "Id"}
 _FFI_INTEGER_TYPES = {
     "i8", "i16", "i32", "i64",
     "u8", "u16", "u32", "u64",
@@ -521,7 +523,13 @@ class _Analyzer:
             if function.external_abi is not None:
                 self._validate_extern_function(function)
         for declaration in self.types.values():
-            if declaration.name == "FrameBuffer":
+            if declaration.name in _BUILTIN_TYPES and declaration.name != "FrameBuffer":
+                self.error(
+                    "E_RESERVED_TYPE",
+                    f"Type name {declaration.name!r} is reserved for a built-in type",
+                    declaration.span,
+                )
+            elif declaration.name == "FrameBuffer":
                 self.error(
                     "E_RESERVED_TYPE",
                     "Type name 'FrameBuffer' is reserved for frame-managed storage",
@@ -604,6 +612,12 @@ class _Analyzer:
     def _validate_type(self, type_expr: TypeExpr) -> None:
         for argument in type_expr.arguments:
             self._validate_type(argument)
+        if type_expr.name in _UNSUPPORTED_BUILTIN_TYPES:
+            self.error(
+                "E_UNSUPPORTED_TYPE",
+                f"Built-in type {type_expr.name!r} is recognized but not supported",
+                type_expr.span,
+            )
         if type_expr.unit_expression is not None:
             if type_expr.name != "Tensor" and type_expr.name not in _NUMERIC_TYPES:
                 self.error(
@@ -1839,15 +1853,11 @@ class _Analyzer:
                 target.span,
             )
             return None
-        if is_tensor_gradient and (
-            return_type.name != parameter_type.element_type.name
-            or not _is_linear_autodiff_unit(parameter_type)
-            or not _is_linear_autodiff_unit(return_type)
-        ):
+        if is_tensor_gradient and return_type.name != parameter_type.element_type.name:
             self.error(
                 "E_GRADIENT_UNIT",
                 "Tensor autodiff requires matching f32/f64 element types and "
-                "linear input and output units",
+                "compatible differentiable input and output units",
                 target.span,
             )
             return None
@@ -1890,11 +1900,12 @@ class _Analyzer:
         assert parameter_type.element_type is not None
         unit = _combine_units(return_type.unit, parameter_type.unit, -1)
         scale = return_type.unit_scale / parameter_type.unit_scale
+        pi_power = return_type.unit_pi_power - parameter_type.unit_pi_power
         output_symbol = return_type.unit_symbol or "1"
         input_symbol = parameter_type.unit_symbol or "1"
         unit_symbol = (
             ""
-            if output_symbol == input_symbol and scale == 1 and not unit
+            if scale == 1 and pi_power == 0 and not unit
             else f"{output_symbol}/{input_symbol}"
         )
         return self._record(
@@ -1906,6 +1917,7 @@ class _Analyzer:
                 unit,
                 scale,
                 unit_symbol=unit_symbol,
+                unit_pi_power=pi_power,
             ),
         )
 
@@ -1959,15 +1971,6 @@ def _is_unitless_float(type_: AetherType) -> bool:
     )
 
 
-def _is_linear_autodiff_unit(type_: AetherType) -> bool:
-    return not (
-        type_.unit_kind == "absolute_temperature"
-        or type_.unit_offset
-        or type_.unit_pi_power
-        or any(dimension == "angle" for dimension, _ in type_.unit)
-    )
-
-
 def _is_differentiable_expression(expression: Expr) -> bool:
     if expression.kind == "literal":
         return bool(
@@ -1989,6 +1992,32 @@ def _is_differentiable_expression(expression: Expr) -> bool:
             and _is_differentiable_expression(expression.children[0])
         )
     if expression.kind == "binary":
+        if expression.value == "|>" and len(expression.children) == 2:
+            left, right = expression.children
+            if right.kind == "call" and right.children:
+                callee = right.children[0]
+                arguments = (left, *right.children[1:])
+            else:
+                callee = right
+                arguments = (left,)
+            if callee.kind != "identifier" or callee.value not in {
+                "convert",
+                "mean",
+                "sum",
+                "scale",
+                "subtract",
+            }:
+                return False
+            return all(
+                _is_differentiable_expression(argument)
+                for index, argument in enumerate(arguments)
+                if not (
+                    callee.value == "convert"
+                    and index == len(arguments) - 1
+                    and argument.kind == "literal"
+                    and argument.value.startswith(("'", '"'))
+                )
+            )
         return (
             expression.value in {"+", "-", "*", "/"}
             and len(expression.children) == 2
@@ -2002,6 +2031,11 @@ def _is_differentiable_expression(expression: Expr) -> bool:
             return (
                 len(expression.children) == 2
                 and _is_differentiable_expression(expression.children[1])
+            )
+        if callee in {"scale", "subtract"}:
+            return len(expression.children) == 3 and all(
+                _is_differentiable_expression(argument)
+                for argument in expression.children[1:]
             )
         return (
             callee == "convert"

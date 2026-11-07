@@ -13,6 +13,10 @@ from src.parser import CSTNode, parse
 
 
 _WORD_KINDS = {"IDENTIFIER", "KEYWORD", "NUMBER", "STRING"}
+_MERGING_OPERATORS = {
+    "?.", "|>", "++", "--", "**", "//", "/*", "<<", ">>", "&&", "||",
+    "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "::",
+}
 _RESERVED = {
     "fn", "func", "type", "struct", "let", "var", "const", "return",
     "if", "else", "for", "while", "match", "true", "false", "none",
@@ -219,24 +223,31 @@ def _view(
                 )
         append(")")
 
-    previous_kind = ""
-    previous_value = ""
+    previous_rendered = ""
+    previous_is_word = False
     for kind, value, source_start, source_end in leaves:
-        if output and (
-            (previous_kind in _WORD_KINDS and kind in _WORD_KINDS)
-            or (previous_kind == "OPERATOR" and kind == "OPERATOR")
-        ):
-            append(" ")
-        elif output and previous_value + value in {
-            "?.", "|>", "++", "--", "**", "//", "/*", "<<", ">>",
-        }:
-            append(" ")
         rendered = aliases.get(value, value)
+        current_is_word = (
+            rendered[:1].isalnum()
+            or rendered[:1] == "_"
+            or (value not in aliases and kind in _WORD_KINDS)
+        )
+        if output:
+            if (
+                previous_is_word
+                and current_is_word
+            ) or previous_rendered + rendered in _MERGING_OPERATORS:
+                append(" ")
         start, end = append(rendered)
         mappings.append(
             ViewMapping(source_start, source_end, start, end, "token")
         )
-        previous_kind, previous_value = kind, value
+        previous_rendered = rendered
+        previous_is_word = (
+            rendered[-1:].isalnum()
+            or rendered[-1:] == "_"
+            or (value not in aliases and kind in _WORD_KINDS)
+        )
     return AIView("".join(output), tuple(mappings), profile.name)
 
 

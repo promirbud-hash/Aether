@@ -20,6 +20,7 @@ from src.frontend import (
     SourceSpan,
     TypeDecl,
     TypeExpr,
+    _BUILTIN_TYPES,
     parse_source,
     validate_module,
 )
@@ -106,6 +107,21 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
             return
         modules[path] = parsed.ast
         diagnostics.extend(parsed.diagnostics)
+        for declaration in parsed.ast.declarations:
+            if (
+                isinstance(declaration, TypeDecl)
+                and declaration.name in _BUILTIN_TYPES
+            ):
+                message = (
+                    "Type name 'FrameBuffer' is reserved for frame-managed storage"
+                    if declaration.name == "FrameBuffer"
+                    else f"Type name {declaration.name!r} is reserved for a built-in type"
+                )
+                add_error(
+                    "E_RESERVED_TYPE",
+                    message,
+                    declaration.span,
+                )
         aliases: dict[str, ImportDecl] = {}
         for import_decl in parsed.ast.imports:
             previous = aliases.get(import_decl.alias)

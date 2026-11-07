@@ -1,3 +1,4 @@
+from dataclasses import replace
 import math
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from src.api import (
     CompilationError,
     build_executable,
     build_object,
+    compile_source,
     emit_c99,
     run_source,
 )
@@ -21,7 +23,11 @@ from src.build import (
     C99ToolchainError,
     compile_c99_object,
 )
-from src.interpreter import Quantity
+from src.c99 import emit_c99_module
+from src.c99 import C99LoweringError
+from src.interpreter import Quantity, ResultValue
+from src.ir import IRExpression, IRMatchArm
+from src.semantic import AetherType
 
 
 _STRICT_C99_FLAGS = ("-std=c99", "-pedantic", "-Wall", "-Wextra", "-Werror")
@@ -215,6 +221,344 @@ static void aether_test_free(void *pointer) {
         executable = self.compile_program(generated, harness, prefix=prefix)
         result = self.run_program(executable)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_assignment_retains_borrowed_value_before_releasing_old_owner(self) -> None:
+        source = (
+            "fn rebind(size: u64) -> u64 {\n"
+            "  var bytes = frame_buffer(size);\n"
+            "  bytes = bytes;\n"
+            "  return frame_buffer_len(bytes);\n"
+            "}\n"
+        )
+        generated = emit_c99(source)
+        retain_index = generated.index("aether_frame_buffer_retain(&aether_owner_")
+        release_index = generated.index(
+            "aether_frame_buffer_release(&aether_v_6279746573);",
+            retain_index,
+        )
+        self.assertLess(retain_index, release_index)
+        harness = r"""
+static size_t allocation_count;
+static size_t release_count;
+
+int main(void) {
+    uint64_t length = aether_fn_726562696e64(UINT64_C(5));
+    if (length != UINT64_C(5)) return 1;
+    if (allocation_count != 1 || release_count != 1) return 2;
+    return 0;
+}
+"""
+        prefix = r"""
+#include <stddef.h>
+#include <stdlib.h>
+static void *aether_test_alloc(size_t size);
+static void aether_test_free(void *pointer);
+#define AETHER_FRAME_ALLOC aether_test_alloc
+#define AETHER_FRAME_FREE aether_test_free
+"""
+        harness += r"""
+static void *aether_test_alloc(size_t size) {
+    void *pointer = malloc(size);
+    if (pointer != NULL) ++allocation_count;
+    return pointer;
+}
+
+static void aether_test_free(void *pointer) {
+    ++release_count;
+    free(pointer);
+}
+"""
+        executable = self.compile_program(generated, harness, prefix=prefix)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_assignment_retains_borrowed_value_before_its_cleanup(self) -> None:
+        source = (
+            "fn maybe(size: u64) -> Result<FrameBuffer, IoError> {\n"
+            "  return Ok(frame_buffer(size));\n"
+            "}\n"
+            "fn rebind(size: u64, fallback: FrameBuffer) -> u64 {\n"
+            "  var bytes = frame_buffer(size);\n"
+            "  bytes = bytes;\n"
+            "  return frame_buffer_len(bytes);\n"
+            "}\n"
+        )
+        module = compile_source(source)
+        function = module.function("rebind")
+        assignment = function.body[1]
+        span = assignment.span
+        maybe = module.function("maybe")
+        callee = IRExpression(
+            "identifier",
+            span,
+            AetherType("Unknown"),
+            value="maybe",
+        )
+        size = IRExpression(
+            "identifier",
+            span,
+            AetherType("u64"),
+            value="size",
+        )
+        subject = IRExpression(
+            "call",
+            span,
+            maybe.return_type,
+            children=(callee, size),
+            ownership="owned",
+            temporary_owner=True,
+        )
+        fallback = IRExpression(
+            "identifier",
+            span,
+            AetherType("FrameBuffer"),
+            value="fallback",
+            ownership="borrowed",
+        )
+        payload = IRExpression(
+            "identifier",
+            span,
+            AetherType("FrameBuffer"),
+            value="payload",
+            ownership="borrowed",
+        )
+        match = IRExpression(
+            "match",
+            span,
+            AetherType("FrameBuffer"),
+            children=(subject,),
+            arms=(
+                IRMatchArm("Ok", "payload", payload, span),
+                IRMatchArm("Err", None, fallback, span),
+            ),
+            ownership="borrowed",
+        )
+        changed_function = replace(
+            function,
+            body=(
+                function.body[0],
+                replace(assignment, expression=match),
+                *function.body[2:],
+            ),
+        )
+        changed_module = replace(
+            module,
+            functions=tuple(
+                changed_function if item.name == "rebind" else item
+                for item in module.functions
+            ),
+        )
+        generated = emit_c99_module(changed_module)
+        retain_index = generated.index("aether_frame_buffer_retain(&aether_owner_")
+        cleanup_index = generated.index(
+            "aether_frame_buffer_release(&aether_tmp_",
+            retain_index,
+        )
+        self.assertLess(retain_index, cleanup_index)
+
+        harness = r"""
+static size_t allocation_count;
+static size_t release_count;
+
+int main(void) {
+    aether_frame_buffer fallback = aether_frame_buffer_create(UINT64_C(3));
+    uint64_t length = aether_fn_726562696e64(UINT64_C(5), fallback);
+    if (length != UINT64_C(5)) return 1;
+    if (allocation_count != 3 || release_count != 2) return 2;
+    aether_frame_buffer_release(&fallback);
+    if (release_count != 3) return 3;
+    return 0;
+}
+"""
+        prefix = r"""
+#include <stddef.h>
+#include <stdlib.h>
+static void *aether_test_alloc(size_t size);
+static void aether_test_free(void *pointer);
+#define AETHER_FRAME_ALLOC aether_test_alloc
+#define AETHER_FRAME_FREE aether_test_free
+"""
+        harness += r"""
+static void *aether_test_alloc(size_t size) {
+    void *pointer = malloc(size);
+    if (pointer != NULL) ++allocation_count;
+    return pointer;
+}
+
+static void aether_test_free(void *pointer) {
+    ++release_count;
+    free(pointer);
+}
+"""
+        executable = self.compile_program(generated, harness, prefix=prefix)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_c99_matches_result_arms(self) -> None:
+        source = (
+            "fn choose(result: Result<f32, IoError>) -> f32 {\n"
+            "  return match result {\n"
+            "    Ok(value) => value,\n"
+            "    Err(_) => -1.0\n"
+            "  };\n"
+            "}\n"
+        )
+        harness = r"""
+int main(void) {
+    aether_result_f32_IoError success = {1, 2.5f, 0};
+    aether_result_f32_IoError failure = {0, 0.0f, 1};
+    if (aether_fn_63686f6f7365(success) != 2.5f) return 1;
+    if (aether_fn_63686f6f7365(failure) != -1.0f) return 2;
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(run_source(source, "choose", ResultValue.ok(2.5)), 2.5)
+        self.assertEqual(run_source(source, "choose", ResultValue.err(1)), -1.0)
+
+    def test_f32_absolute_and_max_abs_keep_float_literals(self) -> None:
+        generated = emit_c99(
+            "fn absolute(value: f32) -> f32 { return abs(value); }\n"
+            "fn maximum(values: Tensor<f32, [2]>) -> f32 {\n"
+            "  return max_abs(values);\n"
+            "}\n"
+        )
+
+        self.assertIn("== 0.0f ? 0.0f", generated)
+
+    def test_c99_autodiff_rejects_unsupported_target_with_diagnostic(self) -> None:
+        source = (
+            "fn helper(value: f64) -> f64 { return value * value; }\n"
+            "fn objective(value: f64) -> f64 { return value * value; }\n"
+            "fn derivative(value: f64) -> f64 {\n"
+            "  return gradient(objective, value);\n"
+            "}\n"
+        )
+        module = compile_source(source)
+        objective = module.function("objective")
+        original = objective.body[-1].expression
+        assert original is not None
+        callee = IRExpression(
+            "identifier",
+            original.span,
+            AetherType("Unknown"),
+            value="helper",
+        )
+        call = IRExpression(
+            "call",
+            original.span,
+            original.type,
+            children=(callee, original.children[0]),
+        )
+        changed_statement = replace(objective.body[-1], expression=call)
+        changed_objective = replace(
+            objective,
+            body=(*objective.body[:-1], changed_statement),
+        )
+        changed_module = replace(
+            module,
+            functions=tuple(
+                changed_objective if function.name == "objective" else function
+                for function in module.functions
+            ),
+        )
+
+        with self.assertRaises(C99LoweringError) as raised:
+            emit_c99_module(changed_module)
+
+        self.assertIn(
+            "E_C99_GRADIENT_EXPRESSION",
+            {diagnostic.code for diagnostic in raised.exception.diagnostics},
+        )
+
+    def test_tensor_autodiff_supports_pipeline_scale_and_subtract(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f32, [2]>) -> f32 {\n"
+            "  let scaled = values |> scale(2.0);\n"
+            "  let shifted = scaled |> subtract(values);\n"
+            "  return sum(shifted);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f32, [2]>) -> Tensor<f32, [2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        values = [1.0, -3.0]
+        expected = run_source(source, "derivative", values)
+        self.assertEqual(expected, [1.0, 1.0])
+        executable = self.compile_program(emit_c99(source), r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_2 values = {{1.0f, -3.0f}};
+    aether_tensor_f32_2 gradient =
+        aether_fn_64657269766174697665(values);
+    printf("%.9g %.9g\n", (double)gradient.data[0], (double)gradient.data[1]);
+    return 0;
+}
+""")
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [float(value) for value in result.stdout.split()],
+            expected,
+        )
+
+    def test_tensor_autodiff_differentiates_affine_and_angular_conversions(self) -> None:
+        cases = (
+            (
+                "temperature",
+                "Tensor<f64, [1], degC>",
+                "f64<K>",
+                "Tensor<f64, [1]>",
+                "K",
+                [20.0],
+                [1.0],
+            ),
+            (
+                "angle",
+                "Tensor<f64, [1], deg>",
+                "f64<rad>",
+                "Tensor<f64, [1], rad/deg>",
+                "rad",
+                [180.0],
+                [math.pi / 180.0],
+            ),
+        )
+        for name, input_type, output_type, gradient_type, target_unit, values, expected in cases:
+            with self.subTest(case=name):
+                source = (
+                    f"fn objective(values: {input_type}) -> {output_type} {{\n"
+                    f"  return sum(convert(values, \"{target_unit}\"));\n"
+                    "}\n"
+                    f"fn derivative(values: {input_type}) -> {gradient_type} {{\n"
+                    "  return gradient(objective, values);\n"
+                    "}\n"
+                )
+                reference = run_source(source, "derivative", values)
+                raw_reference = (
+                    reference.value
+                    if isinstance(reference, Quantity)
+                    else reference
+                )
+                self.assertAlmostEqual(raw_reference[0], expected[0], delta=1e-14)
+                executable = self.compile_program(emit_c99(source), r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_1 values = {{180.0}};
+    aether_tensor_f64_1 gradient =
+        aether_fn_64657269766174697665(values);
+    printf("%.17g\n", gradient.data[0]);
+    return 0;
+}
+""")
+                result = self.run_program(executable)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertAlmostEqual(
+                    float(result.stdout.strip()),
+                    expected[0],
+                    delta=1e-14,
+                )
 
     def test_try_failure_releases_previously_evaluated_expression_temporaries(self) -> None:
         source = (
@@ -433,6 +777,7 @@ int main(void) {
         harness: str,
         *,
         prefix: str = "",
+        extra_flags: tuple[str, ...] = (),
     ) -> Path:
         directory = Path(__file__).resolve().parent / f".c99-build-{uuid.uuid4().hex}"
         directory.mkdir()
@@ -444,6 +789,7 @@ int main(void) {
             [
                 *self.compiler(),
                 *_STRICT_C99_FLAGS,
+                *extra_flags,
                 str(source_path),
                 "-o",
                 str(executable_path),
@@ -482,6 +828,525 @@ int main(void) {
     ) -> subprocess.CompletedProcess[str]:
         executable = self.compile_program(generated, harness)
         return self.run_program(executable, *arguments)
+
+    def test_elementwise_fusion_matches_unoptimized_c99_and_interpreter(self) -> None:
+        source = (
+            "fn chain32(values: Tensor<f32, [4]>) -> Tensor<f32, [4]> {\n"
+            "  let doubled = values * 2.0;\n"
+            "  let shifted = doubled + 1.0;\n"
+            "  return shifted - values;\n"
+            "}\n"
+            "fn chain64(values: Tensor<f64, [4]>, scale: f64, offset: f64) "
+            "-> Tensor<f64, [4]> {\n"
+            "  let doubled = values * scale;\n"
+            "  let shifted = doubled + offset;\n"
+            "  return shifted - values;\n"
+            "}\n"
+        )
+        module = compile_source(source)
+        unoptimized = emit_c99_module(module, optimize=False)
+        optimized = emit_c99_module(module)
+        self.assertEqual(optimized, emit_c99_module(module))
+        self.assertEqual(unoptimized.count("for (size_t aether_i_"), 6)
+        self.assertEqual(optimized.count("for (size_t aether_i_"), 2)
+
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_4 input32 = {{1.0f, -2.0f, 3.5f, 16777216.0f}};
+    aether_tensor_f64_4 input64 = {{1.0, -2.0, 3.5, 0.0}};
+    aether_tensor_f32_4 output32 = aether_fn_636861696e3332(input32);
+    aether_tensor_f64_4 output64 =
+        aether_fn_636861696e3634(input64, 2.0, 1.0);
+    for (size_t i = 0; i < 4; ++i)
+        printf("%.9g %.17g ", (double)output32.data[i], output64.data[i]);
+    return 0;
+}
+"""
+        baseline_executable = self.compile_program(unoptimized, harness)
+        fused_executable = self.compile_program(optimized, harness)
+        baseline = self.run_program(baseline_executable)
+        fused = self.run_program(fused_executable)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertEqual(fused.returncode, 0, fused.stderr)
+        self.assertEqual(fused.stdout, baseline.stdout)
+
+        native_values = [float(value) for value in fused.stdout.split()]
+        self.assertEqual(
+            native_values,
+            [2.0, 2.0, -1.0, -1.0, 4.5, 4.5, 16777216.0, 1.0],
+        )
+        self.assertEqual(
+            run_source(source, "chain32", [1.0, -2.0, 3.5, 16777216.0]),
+            [2.0, -1.0, 4.5, 16777216.0],
+        )
+        self.assertEqual(
+            run_source(source, "chain64", [1.0, -2.0, 3.5, 0.0], 2.0, 1.0),
+            [2.0, -1.0, 4.5, 1.0],
+        )
+
+    def test_fusion_preserves_broadcasting_across_tensor_ranks(self) -> None:
+        source = (
+            "fn broadcast32(values: Tensor<f32, [2, 3]>, scale: f32, "
+            "offset: f32) -> Tensor<f32, [2, 3]> {\n"
+            "  let scaled = scale * values;\n"
+            "  let shifted = scaled + offset;\n"
+            "  return shifted - values;\n"
+            "}\n"
+            "fn broadcast64(values: Tensor<f64, [2, 2, 2]>, scale: f64, "
+            "offset: f64) -> Tensor<f64, [2, 2, 2]> {\n"
+            "  let scaled = values * scale;\n"
+            "  let shifted = offset + scaled;\n"
+            "  return shifted - values;\n"
+            "}\n"
+        )
+        module = compile_source(source)
+        unoptimized = emit_c99_module(module, optimize=False)
+        optimized = emit_c99_module(module)
+        self.assertEqual(unoptimized.count("for (size_t aether_i_"), 6)
+        self.assertEqual(optimized.count("for (size_t aether_i_"), 2)
+
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_2x3 input32 =
+        {{16777216.0f, 2.0f, -3.0f, 0.5f, 1.0f, -16777216.0f}};
+    aether_tensor_f64_2x2x2 input64 =
+        {{1.0, -2.0, 3.5, 0.0, 4.0, -0.5, 8.0, -16.0}};
+    aether_tensor_f32_2x3 output32 =
+        aether_fn_62726f6164636173743332(input32, 2.0f, 1.0f);
+    aether_tensor_f64_2x2x2 output64 =
+        aether_fn_62726f6164636173743634(input64, 2.0, 1.0);
+    for (size_t i = 0; i < 6; ++i)
+        printf("%.9g ", (double)output32.data[i]);
+    for (size_t i = 0; i < 8; ++i)
+        printf("%.17g ", output64.data[i]);
+    return 0;
+}
+"""
+        baseline = self.run_program(self.compile_program(unoptimized, harness))
+        fused = self.run_program(self.compile_program(optimized, harness))
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertEqual(fused.returncode, 0, fused.stderr)
+        self.assertEqual(fused.stdout, baseline.stdout)
+
+        actual = [float(value) for value in fused.stdout.split()]
+        expected32 = run_source(
+            source,
+            "broadcast32",
+            [[16777216.0, 2.0, -3.0], [0.5, 1.0, -16777216.0]],
+            2.0,
+            1.0,
+        )
+        expected64 = run_source(
+            source,
+            "broadcast64",
+            [[[1.0, -2.0], [3.5, 0.0]], [[4.0, -0.5], [8.0, -16.0]]],
+            2.0,
+            1.0,
+        )
+        expected = [
+            *expected32[0],
+            *expected32[1],
+            *expected64[0][0],
+            *expected64[0][1],
+            *expected64[1][0],
+            *expected64[1][1],
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual[0], 16777216.0)
+
+    def test_fusion_preserves_non_associative_f32_and_f64_expression_order(self) -> None:
+        source = (
+            "fn ordered32(large: Tensor<f32, [4]>, "
+            "opposite: Tensor<f32, [4]>, residue: Tensor<f32, [4]>) "
+            "-> Tensor<f32, [4]> {\n"
+            "  let cancelled = large + opposite;\n"
+            "  return cancelled + residue;\n"
+            "}\n"
+            "fn ordered64(large: Tensor<f64, [4]>, "
+            "opposite: Tensor<f64, [4]>, residue: Tensor<f64, [4]>) "
+            "-> Tensor<f64, [4]> {\n"
+            "  let cancelled = large + opposite;\n"
+            "  return cancelled + residue;\n"
+            "}\n"
+        )
+        module = compile_source(source)
+        baseline_c = emit_c99_module(module, optimize=False)
+        fused_c = emit_c99_module(module)
+        self.assertEqual(baseline_c.count("for (size_t aether_i_"), 4)
+        self.assertEqual(fused_c.count("for (size_t aether_i_"), 2)
+
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_4 large32 = {{1.2676506e30f, 1.2676506e30f,
+                                    1.2676506e30f, 1.2676506e30f}};
+    aether_tensor_f32_4 opposite32 = {{-1.2676506e30f, -1.2676506e30f,
+                                       -1.2676506e30f, -1.2676506e30f}};
+    aether_tensor_f32_4 residue32 = {{1.0f, -1.0f, 0.25f, -0.5f}};
+    aether_tensor_f64_4 large64 = {{1e300, 1e300, 1e300, 1e300}};
+    aether_tensor_f64_4 opposite64 = {{-1e300, -1e300, -1e300, -1e300}};
+    aether_tensor_f64_4 residue64 = {{1.0, -1.0, 0.25, -0.5}};
+    aether_tensor_f32_4 output32 =
+        aether_fn_6f7264657265643332(large32, opposite32, residue32);
+    aether_tensor_f64_4 output64 =
+        aether_fn_6f7264657265643634(large64, opposite64, residue64);
+    for (size_t index = 0; index < 4; ++index)
+        printf("%.9g ", (double)output32.data[index]);
+    for (size_t index = 0; index < 4; ++index)
+        printf("%.17g ", output64.data[index]);
+    return 0;
+}
+"""
+        baseline = self.run_program(self.compile_program(baseline_c, harness))
+        fused = self.run_program(self.compile_program(fused_c, harness))
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertEqual(fused.returncode, 0, fused.stderr)
+        self.assertEqual(fused.stdout, baseline.stdout)
+
+        actual = [float(value) for value in fused.stdout.split()]
+        expected = [
+            *run_source(source, "ordered32", [1.2676506e30] * 4,
+                        [-1.2676506e30] * 4, [1.0, -1.0, 0.25, -0.5]),
+            *run_source(source, "ordered64", [1e300] * 4, [-1e300] * 4,
+                        [1.0, -1.0, 0.25, -0.5]),
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(expected, [1.0, -1.0, 0.25, -0.5] * 2)
+
+    def test_compiled_tensor_autodiff_covers_missing_f32_and_f64_ranks(self) -> None:
+        source = (
+            "fn rank2_objective(values: Tensor<f32, [2, 3]>) -> f32 {\n"
+            "  return sum(values * mean(values));\n"
+            "}\n"
+            "fn rank2_derivative(values: Tensor<f32, [2, 3]>) "
+            "-> Tensor<f32, [2, 3]> {\n"
+            "  return gradient(rank2_objective, values);\n"
+            "}\n"
+            "fn rank4_objective(values: Tensor<f64, [2, 1, 2, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values / (average + average * average));\n"
+            "}\n"
+            "fn rank4_derivative(values: Tensor<f64, [2, 1, 2, 2]>) "
+            "-> Tensor<f64, [2, 1, 2, 2]> {\n"
+            "  return gradient(rank4_objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_2x3 rank2_input = {{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}};
+    aether_tensor_f64_2x1x2x2 rank4_input =
+        {{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}};
+    aether_tensor_f32_2x3 rank2_output =
+        aether_fn_72616e6b325f64657269766174697665(rank2_input);
+    aether_tensor_f64_2x1x2x2 rank4_output =
+        aether_fn_72616e6b345f64657269766174697665(rank4_input);
+    for (size_t index = 0; index < 6; ++index)
+        printf("%.17g ", (double)rank2_output.data[index]);
+    for (size_t index = 0; index < 8; ++index)
+        printf("%.17g ", rank4_output.data[index]);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        native = [float(value) for value in result.stdout.split()]
+        self.assertEqual(len(native), 14)
+
+        cases = (
+            (
+                "rank2_f32",
+                "rank2_derivative",
+                [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                [7.0] * 6,
+            ),
+            (
+                "rank4_f64",
+                "rank4_derivative",
+                [[[[1.0, 2.0], [3.0, 4.0]]], [[[5.0, 6.0], [7.0, 8.0]]]],
+                [-4.0 / 121.0] * 8,
+            ),
+        )
+
+        def flatten(value: object) -> list[float]:
+            if isinstance(value, list):
+                return [item for child in value for item in flatten(child)]
+            return [float(value)]
+
+        offset = 0
+        for name, function, values, expected in cases:
+            with self.subTest(case=name):
+                reference = flatten(run_source(source, function, values))
+                compiled = native[offset:offset + len(expected)]
+                offset += len(expected)
+                self.assertEqual(len(reference), len(expected))
+                for actual, interpreted, analytic in zip(
+                    compiled, reference, expected
+                ):
+                    self.assertAlmostEqual(interpreted, analytic, delta=1e-14)
+                    self.assertAlmostEqual(actual, analytic, delta=1e-14)
+                    self.assertAlmostEqual(actual, interpreted, delta=1e-14)
+
+    def test_tensor_and_autodiff_results_match_at_optimization_levels(self) -> None:
+        source = (
+            "fn scalar_objective(value: f32) -> f32 {\n"
+            "  let positive = value * 16777216.0;\n"
+            "  let negative = value * -16777216.0;\n"
+            "  return positive + value + negative;\n"
+            "}\n"
+            "fn scalar_gradient(value: f32) -> f32 {\n"
+            "  return gradient(scalar_objective, value);\n"
+            "}\n"
+            "fn tensor_objective(values: Tensor<f32, [2, 3]>) -> f32 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn tensor_gradient(values: Tensor<f32, [2, 3]>) "
+            "-> Tensor<f32, [2, 3]> {\n"
+            "  return gradient(tensor_objective, values);\n"
+            "}\n"
+            "fn rank4_objective(values: Tensor<f64, [2, 1, 2, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values / (average + average * average));\n"
+            "}\n"
+            "fn rank4_gradient(values: Tensor<f64, [2, 1, 2, 2]>) "
+            "-> Tensor<f64, [2, 1, 2, 2]> {\n"
+            "  return gradient(rank4_objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_2x3 tensor = {{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}};
+    aether_tensor_f64_2x1x2x2 rank4 =
+        {{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}};
+    aether_tensor_f32_2x3 tensor_result =
+        aether_fn_74656e736f725f6772616469656e74(tensor);
+    aether_tensor_f64_2x1x2x2 rank4_result =
+        aether_fn_72616e6b345f6772616469656e74(rank4);
+    printf("%.9g\n", (double)aether_fn_7363616c61725f6772616469656e74(1.0f));
+    for (size_t index = 0; index < 6; ++index)
+        printf("%.9g\n", (double)tensor_result.data[index]);
+    for (size_t index = 0; index < 8; ++index)
+        printf("%.17g\n", rank4_result.data[index]);
+    return 0;
+}
+"""
+        def flatten(value: object) -> list[float]:
+            if isinstance(value, list):
+                return [item for child in value for item in flatten(child)]
+            return [float(value)]
+
+        expected = [float(run_source(source, "scalar_gradient", 1.0))]
+        expected.extend(
+            flatten(
+                run_source(
+                    source,
+                    "tensor_gradient",
+                    [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                )
+            )
+        )
+        expected.extend(
+            flatten(
+                run_source(
+                    source,
+                    "rank4_gradient",
+                    [[[[1.0, 2.0], [3.0, 4.0]]], [[[5.0, 6.0], [7.0, 8.0]]]],
+                )
+            )
+        )
+        self.assertEqual(expected[:7], [1.0] + [7.0] * 6)
+        for value in expected[7:]:
+            self.assertAlmostEqual(value, -4.0 / 121.0, delta=1e-14)
+
+        results: dict[str, list[float]] = {}
+        for optimization in ("-O0", "-O2"):
+            with self.subTest(optimization=optimization):
+                executable = self.compile_program(
+                    emit_c99(source),
+                    harness,
+                    extra_flags=(optimization,),
+                )
+                result = self.run_program(executable)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                actual = [float(value) for value in result.stdout.splitlines()]
+                self.assertEqual(len(actual), len(expected))
+                for native, reference in zip(actual, expected):
+                    self.assertAlmostEqual(native, reference, delta=1e-14)
+                results[optimization] = actual
+        self.assertEqual(results["-O0"], results["-O2"])
+
+    def test_generated_c99_matches_interpreter_with_msvc(self) -> None:
+        compiler = shutil.which("cl.exe")
+        if compiler is None:
+            self.skipTest("MSVC cl.exe is not available in the active environment")
+
+        source = (
+            "fn scalar_objective(value: f32) -> f32 {\n"
+            "  let positive = value * 16777216.0;\n"
+            "  let negative = value * -16777216.0;\n"
+            "  return positive + value + negative;\n"
+            "}\n"
+            "fn scalar_gradient(value: f32) -> f32 {\n"
+            "  return gradient(scalar_objective, value);\n"
+            "}\n"
+            "fn tensor_objective(values: Tensor<f32, [2, 3]>) -> f32 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn tensor_gradient(values: Tensor<f32, [2, 3]>) "
+            "-> Tensor<f32, [2, 3]> {\n"
+            "  return gradient(tensor_objective, values);\n"
+            "}\n"
+            "fn rank4_objective(values: Tensor<f64, [2, 1, 2, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values / (average + average * average));\n"
+            "}\n"
+            "fn rank4_gradient(values: Tensor<f64, [2, 1, 2, 2]>) "
+            "-> Tensor<f64, [2, 1, 2, 2]> {\n"
+            "  return gradient(rank4_objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_2x3 tensor = {{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}};
+    aether_tensor_f64_2x1x2x2 rank4 =
+        {{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}};
+    aether_tensor_f32_2x3 tensor_result =
+        aether_fn_74656e736f725f6772616469656e74(tensor);
+    aether_tensor_f64_2x1x2x2 rank4_result =
+        aether_fn_72616e6b345f6772616469656e74(rank4);
+    printf("%.9g\n", (double)aether_fn_7363616c61725f6772616469656e74(1.0f));
+    for (size_t index = 0; index < 6; ++index)
+        printf("%.9g\n", (double)tensor_result.data[index]);
+    for (size_t index = 0; index < 8; ++index)
+        printf("%.17g\n", rank4_result.data[index]);
+    return 0;
+}
+"""
+
+        def flatten(value: object) -> list[float]:
+            if isinstance(value, list):
+                return [item for child in value for item in flatten(child)]
+            return [float(value)]
+
+        expected = [float(run_source(source, "scalar_gradient", 1.0))]
+        expected.extend(
+            flatten(
+                run_source(
+                    source,
+                    "tensor_gradient",
+                    [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                )
+            )
+        )
+        expected.extend(
+            flatten(
+                run_source(
+                    source,
+                    "rank4_gradient",
+                    [[[[1.0, 2.0], [3.0, 4.0]]], [[[5.0, 6.0], [7.0, 8.0]]]],
+                )
+            )
+        )
+        self.assertEqual(expected[:7], [1.0] + [7.0] * 6)
+        for value in expected[7:]:
+            self.assertAlmostEqual(value, -4.0 / 121.0, delta=1e-14)
+
+        with tempfile.TemporaryDirectory(prefix="aether-msvc-c99-") as directory:
+            root = Path(directory)
+            source_path = root / "generated.c"
+            executable_path = root / "generated.exe"
+            source_path.write_text(
+                emit_c99(source) + "\n" + harness,
+                encoding="utf-8",
+                newline="\n",
+            )
+            for optimization in ("/Od", "/O2"):
+                with self.subTest(optimization=optimization):
+                    compiled = subprocess.run(
+                        [
+                            compiler,
+                            "/nologo",
+                            "/std:c11",
+                            "/TC",
+                            "/W4",
+                            "/WX",
+                            "/wd4127",
+                            "/fp:strict",
+                            optimization,
+                            str(source_path),
+                            f"/Fo:{root / 'generated.obj'}",
+                            f"/Fe:{executable_path}",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=180,
+                    )
+                    self.assertEqual(
+                        compiled.returncode,
+                        0,
+                        f"MSVC C99 compilation failed:\n"
+                        f"{compiled.stdout}\n{compiled.stderr}",
+                    )
+                    result = subprocess.run(
+                        [str(executable_path)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        cwd=root,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    actual = [float(value) for value in result.stdout.splitlines()]
+                    self.assertEqual(len(actual), len(expected))
+                    for native, reference in zip(actual, expected):
+                        self.assertAlmostEqual(native, reference, delta=1e-14)
+
+    def test_compiled_f32_tensor_gradient_supports_rank_four(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f32, [2, 1, 2, 2]>) -> f32 {\n"
+            "  return sum(values * 0.125);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f32, [2, 1, 2, 2]>) "
+            "-> Tensor<f32, [2, 1, 2, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_2x1x2x2 input =
+        {{1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f, 7.0f, -8.0f}};
+    aether_tensor_f32_2x1x2x2 output =
+        aether_fn_64657269766174697665(input);
+    for (size_t index = 0; index < 8; ++index)
+        printf("%.9g ", (double)output.data[index]);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        values = [[[[1.0, -2.0], [3.0, -4.0]]],
+                  [[[5.0, -6.0], [7.0, -8.0]]]]
+        expected_nested = run_source(source, "derivative", values)
+        expected = [
+            item
+            for outer in expected_nested
+            for middle in outer
+            for inner in middle
+            for item in inner
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual, [0.125] * 8)
 
     def test_generated_c99_compiles_when_a_c_compiler_is_available(self) -> None:
         compiler = self.compiler()
@@ -1757,6 +2622,516 @@ int main(void) {
         self.assertEqual(actual, expected)
         self.assertEqual(actual, [1.0, 0.25, 0.5] * 4 + [1.0, 0.25, 1.0] * 4)
 
+    def test_compiled_f64_rank2_autodiff_preserves_rectangular_tensor_shape(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 3]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 3]>) "
+            "-> Tensor<f64, [2, 3]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x3 values = {{1.0, 2.0, 3.0, 4.0, 5.0, 7.0}};
+    aether_tensor_f64_2x3 gradient =
+        aether_fn_64657269766174697665(values);
+    for (size_t index = 0; index < 6; ++index)
+        printf("%.17g\n", gradient.data[index]);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        reference = run_source(
+            source,
+            "derivative",
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 7.0]],
+        )
+        self.assertEqual(len(actual), 6)
+        self.assertEqual([len(row) for row in reference], [3, 3])
+        for native, row_value in zip(
+            actual,
+            (item for row in reference for item in row),
+        ):
+            self.assertAlmostEqual(native, row_value, delta=1e-14)
+            self.assertAlmostEqual(native, 22.0 / 3.0, delta=1e-14)
+
+    def test_compiled_f64_rank3_autodiff_broadcasts_shared_reduction_gradient(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+            "fn reverse_objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(average * values);\n"
+            "}\n"
+            "fn reverse_derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(reverse_objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x1x2 ordinary = {{1.0, 2.0, 3.0, 6.0}};
+    aether_tensor_f64_2x1x2 cancellation = {{1e16, -1e16, 1.0, 3.0}};
+    aether_tensor_f64_2x1x2 ordinary_gradient =
+        aether_fn_64657269766174697665(ordinary);
+    aether_tensor_f64_2x1x2 cancellation_gradient =
+        aether_fn_64657269766174697665(cancellation);
+    aether_tensor_f64_2x1x2 ordinary_reverse_gradient =
+        aether_fn_726576657273655f64657269766174697665(ordinary);
+    aether_tensor_f64_2x1x2 cancellation_reverse_gradient =
+        aether_fn_726576657273655f64657269766174697665(cancellation);
+    printf("%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g "
+           "%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+        ordinary_gradient.data[0], ordinary_gradient.data[1],
+        ordinary_gradient.data[2], ordinary_gradient.data[3],
+        ordinary_reverse_gradient.data[0], ordinary_reverse_gradient.data[1],
+        ordinary_reverse_gradient.data[2], ordinary_reverse_gradient.data[3],
+        cancellation_gradient.data[0], cancellation_gradient.data[1],
+        cancellation_gradient.data[2], cancellation_gradient.data[3],
+        cancellation_reverse_gradient.data[0],
+        cancellation_reverse_gradient.data[1],
+        cancellation_reverse_gradient.data[2],
+        cancellation_reverse_gradient.data[3]);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        expected = [6.0] * 8 + [2.0] * 8
+        self.assertEqual(actual, expected)
+
+        for values, gradient_value in (
+            ([[[1.0, 2.0]], [[3.0, 6.0]]], 6.0),
+            ([[[1e16, -1e16]], [[1.0, 3.0]]], 2.0),
+        ):
+            reference = run_source(source, "derivative", values)
+            self.assertEqual(
+                reference,
+                [[[gradient_value, gradient_value]], [[gradient_value, gradient_value]]],
+            )
+            reverse_reference = run_source(source, "reverse_derivative", values)
+            self.assertEqual(
+                reverse_reference,
+                [[[gradient_value, gradient_value]], [[gradient_value, gradient_value]]],
+            )
+
+    def test_compiled_f64_rank3_autodiff_with_non_singleton_dimensions(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 2, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 2, 2]>) "
+            "-> Tensor<f64, [2, 2, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x2x2 ordinary =
+        {{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}};
+    aether_tensor_f64_2x2x2 cancellation =
+        {{1e16, -1e16, 1.0, 3.0, 1e16, -1e16, 1.0, 3.0}};
+    aether_tensor_f64_2x2x2 ordinary_gradient =
+        aether_fn_64657269766174697665(ordinary);
+    aether_tensor_f64_2x2x2 cancellation_gradient =
+        aether_fn_64657269766174697665(cancellation);
+    for (size_t i = 0; i < 8; ++i) {
+        printf("%.17g %.17g ", ordinary_gradient.data[i],
+            cancellation_gradient.data[i]);
+    }
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [float(value) for value in result.stdout.split()],
+            [9.0, 2.0] * 8,
+        )
+
+        cases = (
+            (
+                [[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]],
+                9.0,
+            ),
+            (
+                [
+                    [[1e16, -1e16], [1.0, 3.0]],
+                    [[1e16, -1e16], [1.0, 3.0]],
+                ],
+                2.0,
+            ),
+        )
+        for values, expected in cases:
+            self.assertEqual(
+                run_source(source, "derivative", values),
+                [[[expected, expected], [expected, expected]]] * 2,
+            )
+
+    def test_compiled_f64_rank3_autodiff_with_uneven_inner_dimension(self) -> None:
+        source = (
+            "fn sum_objective(values: Tensor<f64, [2, 3, 2]>) -> f64 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn sum_gradient(values: Tensor<f64, [2, 3, 2]>) "
+            "-> Tensor<f64, [2, 3, 2]> {\n"
+            "  return gradient(sum_objective, values);\n"
+            "}\n"
+            "fn mean_objective(values: Tensor<f64, [2, 3, 2]>) -> f64 {\n"
+            "  return mean(values);\n"
+            "}\n"
+            "fn mean_gradient(values: Tensor<f64, [2, 3, 2]>) "
+            "-> Tensor<f64, [2, 3, 2]> {\n"
+            "  return gradient(mean_objective, values);\n"
+            "}\n"
+            "fn objective(values: Tensor<f64, [2, 3, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 3, 2]>) "
+            "-> Tensor<f64, [2, 3, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x3x2 ordinary =
+        {{1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+          7.0, 8.0, 9.0, 10.0, 11.0, 12.0}};
+    aether_tensor_f64_2x3x2 cancellation =
+        {{1e16, -1e16, 1e16, -1e16, 1e16, -1e16,
+          1.0, 3.0, 1.0, 3.0, 1.0, 3.0}};
+    aether_tensor_f64_2x3x2 ordinary_gradient =
+        aether_fn_64657269766174697665(ordinary);
+    aether_tensor_f64_2x3x2 cancellation_gradient =
+        aether_fn_64657269766174697665(cancellation);
+    aether_tensor_f64_2x3x2 ordinary_sum_gradient =
+        aether_fn_73756d5f6772616469656e74(ordinary);
+    aether_tensor_f64_2x3x2 ordinary_mean_gradient =
+        aether_fn_6d65616e5f6772616469656e74(ordinary);
+    aether_tensor_f64_2x3x2 cancellation_sum_gradient =
+        aether_fn_73756d5f6772616469656e74(cancellation);
+    aether_tensor_f64_2x3x2 cancellation_mean_gradient =
+        aether_fn_6d65616e5f6772616469656e74(cancellation);
+    for (size_t i = 0; i < 12; ++i) {
+        printf("%.17g %.17g %.17g %.17g %.17g %.17g ",
+            ordinary_sum_gradient.data[i], ordinary_mean_gradient.data[i],
+            ordinary_gradient.data[i], cancellation_sum_gradient.data[i],
+            cancellation_mean_gradient.data[i], cancellation_gradient.data[i]);
+    }
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [float(value) for value in result.stdout.split()],
+            [1.0, 1.0 / 12.0, 13.0, 1.0, 1.0 / 12.0, 2.0] * 12,
+        )
+
+        cases = (
+            (
+                [
+                    [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+                    [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
+                ],
+                13.0,
+            ),
+            (
+                [
+                    [
+                        [1e16, -1e16],
+                        [1e16, -1e16],
+                        [1e16, -1e16],
+                    ],
+                    [[1.0, 3.0], [1.0, 3.0], [1.0, 3.0]],
+                ],
+                2.0,
+            ),
+        )
+        for values, expected in cases:
+            self.assertEqual(
+                run_source(source, "derivative", values),
+                [[[expected, expected] for _ in range(3)] for _ in range(2)],
+            )
+
+    def test_compiled_f32_rank3_autodiff_with_uneven_inner_dimension(self) -> None:
+        source = (
+            "fn sum_objective(values: Tensor<f32, [2, 3, 2]>) -> f32 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn sum_gradient(values: Tensor<f32, [2, 3, 2]>) "
+            "-> Tensor<f32, [2, 3, 2]> {\n"
+            "  return gradient(sum_objective, values);\n"
+            "}\n"
+            "fn mean_objective(values: Tensor<f32, [2, 3, 2]>) -> f32 {\n"
+            "  return mean(values);\n"
+            "}\n"
+            "fn mean_gradient(values: Tensor<f32, [2, 3, 2]>) "
+            "-> Tensor<f32, [2, 3, 2]> {\n"
+            "  return gradient(mean_objective, values);\n"
+            "}\n"
+            "fn objective(values: Tensor<f32, [2, 3, 2]>) -> f32 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values * average);\n"
+            "}\n"
+            "fn derivative(values: Tensor<f32, [2, 3, 2]>) "
+            "-> Tensor<f32, [2, 3, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f32_2x3x2 values =
+        {{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f,
+          7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f}};
+    aether_tensor_f32_2x3x2 gradient =
+        aether_fn_64657269766174697665(values);
+    aether_tensor_f32_2x3x2 sum_gradient =
+        aether_fn_73756d5f6772616469656e74(values);
+    aether_tensor_f32_2x3x2 mean_gradient =
+        aether_fn_6d65616e5f6772616469656e74(values);
+    for (size_t i = 0; i < 12; ++i) {
+        printf("%.9g %.9g %.9g ", (double)sum_gradient.data[i],
+            (double)mean_gradient.data[i], (double)gradient.data[i]);
+    }
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        expected = []
+        for _ in range(12):
+            expected.extend((1.0, 1.0 / 12.0, 13.0))
+        self.assertEqual(len(actual), len(expected))
+        for native, reference in zip(actual, expected):
+            self.assertAlmostEqual(native, reference, delta=1e-7)
+
+        values = [
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+            [[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]],
+        ]
+        self.assertEqual(
+            run_source(source, "derivative", values),
+            [[[13.0, 13.0] for _ in range(3)] for _ in range(2)],
+        )
+
+    def test_compiled_f64_rank3_autodiff_sums_broadcast_adjoint(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  return sum(values + mean(values));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x1x2 ordinary = {{1.0, 2.0, 3.0, 6.0}};
+    aether_tensor_f64_2x1x2 cancellation = {{1e16, -1e16, 1.0, 3.0}};
+    aether_tensor_f64_2x1x2 ordinary_gradient =
+        aether_fn_64657269766174697665(ordinary);
+    aether_tensor_f64_2x1x2 cancellation_gradient =
+        aether_fn_64657269766174697665(cancellation);
+    printf("%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+        ordinary_gradient.data[0], ordinary_gradient.data[1],
+        ordinary_gradient.data[2], ordinary_gradient.data[3],
+        cancellation_gradient.data[0], cancellation_gradient.data[1],
+        cancellation_gradient.data[2], cancellation_gradient.data[3]);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        self.assertEqual(actual, [2.0] * 8)
+
+        for values in (
+            [[[1.0, 2.0]], [[3.0, 6.0]]],
+            [[[1e16, -1e16]], [[1.0, 3.0]]],
+        ):
+            self.assertEqual(
+                run_source(source, "derivative", values),
+                [[[2.0, 2.0]], [[2.0, 2.0]]],
+            )
+
+    def test_compiled_f64_rank3_autodiff_negates_broadcast_mean_gradient(self) -> None:
+        source = (
+            "fn neg_mean(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  return sum(values + (-mean(values)));\n"
+            "}\n"
+            "fn neg_mean_gradient(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(neg_mean, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x1x2 ordinary = {{1.0, 2.0, 3.0, 6.0}};
+    aether_tensor_f64_2x1x2 cancellation = {{1e16, -1e16, 1.0, 3.0}};
+    aether_tensor_f64_2x1x2 ordinary_gradient =
+        aether_fn_6e65675f6d65616e5f6772616469656e74(ordinary);
+    aether_tensor_f64_2x1x2 cancellation_gradient =
+        aether_fn_6e65675f6d65616e5f6772616469656e74(cancellation);
+    for (size_t i = 0; i < 4; ++i) {
+        printf("%.17g %.17g ", ordinary_gradient.data[i],
+            cancellation_gradient.data[i]);
+    }
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            [float(value) for value in result.stdout.split()],
+            [0.0] * 8,
+        )
+        for values in (
+            [[[1.0, 2.0]], [[3.0, 6.0]]],
+            [[[1e16, -1e16]], [[1.0, 3.0]]],
+        ):
+            self.assertEqual(
+                run_source(source, "neg_mean_gradient", values),
+                [[[0.0, 0.0]], [[0.0, 0.0]]],
+            )
+
+    def test_compiled_f64_rank3_autodiff_broadcast_subtraction_gradients(self) -> None:
+        source = (
+            "fn tensor_minus_scalar(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values - average);\n"
+            "}\n"
+            "fn tensor_minus_scalar_gradient(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(tensor_minus_scalar, values);\n"
+            "}\n"
+            "fn scalar_minus_tensor(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(average - values);\n"
+            "}\n"
+            "fn scalar_minus_tensor_gradient(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(scalar_minus_tensor, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x1x2 ordinary = {{1.0, 2.0, 3.0, 6.0}};
+    aether_tensor_f64_2x1x2 cancellation = {{1e16, -1e16, 1.0, 3.0}};
+    aether_tensor_f64_2x1x2 ordinary_tensor_minus =
+        aether_fn_74656e736f725f6d696e75735f7363616c61725f6772616469656e74(
+            ordinary);
+    aether_tensor_f64_2x1x2 ordinary_scalar_minus =
+        aether_fn_7363616c61725f6d696e75735f74656e736f725f6772616469656e74(
+            ordinary);
+    aether_tensor_f64_2x1x2 cancellation_tensor_minus =
+        aether_fn_74656e736f725f6d696e75735f7363616c61725f6772616469656e74(
+            cancellation);
+    aether_tensor_f64_2x1x2 cancellation_scalar_minus =
+        aether_fn_7363616c61725f6d696e75735f74656e736f725f6772616469656e74(
+            cancellation);
+    for (size_t i = 0; i < 4; ++i) {
+        printf("%.17g %.17g %.17g %.17g ",
+            ordinary_tensor_minus.data[i], ordinary_scalar_minus.data[i],
+            cancellation_tensor_minus.data[i], cancellation_scalar_minus.data[i]);
+    }
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([float(value) for value in result.stdout.split()], [0.0] * 16)
+
+        for values in (
+            [[[1.0, 2.0]], [[3.0, 6.0]]],
+            [[[1e16, -1e16]], [[1.0, 3.0]]],
+        ):
+            self.assertEqual(
+                run_source(source, "tensor_minus_scalar_gradient", values),
+                [[[0.0, 0.0]], [[0.0, 0.0]]],
+            )
+            self.assertEqual(
+                run_source(source, "scalar_minus_tensor_gradient", values),
+                [[[0.0, 0.0]], [[0.0, 0.0]]],
+            )
+
+    def test_compiled_f64_rank3_autodiff_division_gradient(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2, 1, 2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values / (average + average * average));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2, 1, 2]>) "
+            "-> Tensor<f64, [2, 1, 2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x1x2 ordinary = {{1.0, 3.0, 5.0, 7.0}};
+    aether_tensor_f64_2x1x2 cancellation = {{1e16, -1e16, 1.0, 3.0}};
+    aether_tensor_f64_2x1x2 ordinary_gradient =
+        aether_fn_64657269766174697665(ordinary);
+    aether_tensor_f64_2x1x2 cancellation_gradient =
+        aether_fn_64657269766174697665(cancellation);
+    printf("%.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+        ordinary_gradient.data[0], ordinary_gradient.data[1],
+        ordinary_gradient.data[2], ordinary_gradient.data[3],
+        cancellation_gradient.data[0], cancellation_gradient.data[1],
+        cancellation_gradient.data[2], cancellation_gradient.data[3]);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        expected = [-1.0 / 25.0] * 4 + [-0.25] * 4
+        for native, analytic in zip(actual, expected):
+            self.assertAlmostEqual(native, analytic, delta=1e-12)
+
+        for values, analytic in (
+            ([[[1.0, 3.0]], [[5.0, 7.0]]], -1.0 / 25.0),
+            ([[[1e16, -1e16]], [[1.0, 3.0]]], -0.25),
+        ):
+            reference = run_source(source, "derivative", values)
+            for plane in reference:
+                for row in plane:
+                    for value in row:
+                        self.assertAlmostEqual(value, analytic, delta=1e-12)
+
     def test_compiled_f32_tensor_gradient_chains_shared_reductions_and_units(self) -> None:
         source = (
             "fn objective(values: Tensor<f32, [2]>) -> f32 {\n"
@@ -1922,6 +3297,65 @@ int main(void) {
                     reference,
                     delta=max(1e-6, abs(reference) * 1e-6),
                 )
+
+    def test_compiled_f64_autodiff_tensor_division_gradients(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2]>) -> f64 {\n"
+            "  let average = mean(values);\n"
+            "  return sum(values / (average + average * average));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2]>) -> Tensor<f64, [2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2 positive = {{1.0, 3.0}};
+    aether_tensor_f64_2 negative = {{-0.5, -0.5}};
+    aether_tensor_f64_2 small = {{1e-10, 1e-10}};
+    aether_tensor_f64_2 positive_gradient =
+        aether_fn_64657269766174697665(positive);
+    aether_tensor_f64_2 negative_gradient =
+        aether_fn_64657269766174697665(negative);
+    aether_tensor_f64_2 small_gradient =
+        aether_fn_64657269766174697665(small);
+    printf("%.17g %.17g %.17g %.17g %.17g %.17g\n",
+        positive_gradient.data[0], positive_gradient.data[1],
+        negative_gradient.data[0], negative_gradient.data[1],
+        small_gradient.data[0], small_gradient.data[1]);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+
+        cases = (
+            ([1.0, 3.0], -1.0 / 9.0),
+            ([-0.5, -0.5], -4.0),
+            ([1e-10, 1e-10], -1.0 / (1.0 + 1e-10) ** 2),
+        )
+        expected = []
+        for values, analytic in cases:
+            reference = run_source(source, "derivative", values)
+            self.assertEqual(len(reference), 2)
+            for value in reference:
+                self.assertAlmostEqual(
+                    value,
+                    analytic,
+                    delta=max(abs(analytic) * 1e-9, 1e-12),
+                )
+            expected.extend(reference)
+
+        self.assertEqual(len(actual), len(expected))
+        for native, reference in zip(actual, expected):
+            self.assertAlmostEqual(
+                native,
+                reference,
+                delta=max(abs(reference) * 1e-9, 1e-12),
+            )
 
     def test_compiled_f32_autodiff_adjoint_accumulation_with_cancellation(self) -> None:
         source = (
@@ -2701,6 +4135,26 @@ int main(void) {
         result = self.run_program(executable)
         self.assertNotEqual(result.returncode, 0, result.stdout)
 
+    def test_compiled_f64_tensor_gradient_traps_division_by_zero(self) -> None:
+        source = (
+            "fn objective(values: Tensor<f64, [2]>) -> f64 {\n"
+            "  return sum(values / mean(values));\n"
+            "}\n"
+            "fn derivative(values: Tensor<f64, [2]>) -> Tensor<f64, [2]> {\n"
+            "  return gradient(objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+int main(void) {
+    aether_tensor_f64_2 values = {{0.0, 0.0}};
+    (void)aether_fn_64657269766174697665(values);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
     def test_compiled_reverse_mode_gradient_traps_division_by_zero(self) -> None:
         source = (
             "fn ratio(x: f32) -> f32 { return x / x; }\n"
@@ -2710,6 +4164,22 @@ int main(void) {
         harness = r"""
 int main(void) {
     (void)aether_fn_726174696f5f64657269766174697665(0.0f);
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_compiled_f64_reverse_mode_gradient_traps_division_by_zero(self) -> None:
+        source = (
+            "fn ratio(x: f64) -> f64 { return x / x; }\n"
+            "fn ratio_derivative(x: f64) -> f64 "
+            "{ return gradient(ratio, x); }\n"
+        )
+        harness = r"""
+int main(void) {
+    (void)aether_fn_726174696f5f64657269766174697665(0.0);
     return 0;
 }
 """

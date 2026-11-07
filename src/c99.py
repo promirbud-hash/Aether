@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 
 from src.frontend import Diagnostic, SourceSpan
+from src.fusion import fuse_elementwise_tensors
 from src.ir import IRExpression, IRFunction, IRModule
 from src.semantic import AetherType
 
@@ -296,6 +297,12 @@ class _C99Emitter:
         kind = expression.kind
         if expression.type.name not in {"IoError", "FsError", "NetError"}:
             self.validate_type(expression.type, expression.span, "expression")
+        if kind == "fused_tensor":
+            self.validate_expression(expression.children[0])
+            return
+        if kind == "match":
+            self._validate_match(expression)
+            return
         if kind == "literal":
             self._validate_literal(expression, allow_signed_min_magnitude)
             return
@@ -477,6 +484,127 @@ class _C99Emitter:
         self.error(
             "E_C99_EXPRESSION",
             f"Expression kind {kind!r} is not supported by the C99 backend",
+            expression.span,
+        )
+
+    def _validate_match(self, expression: IRExpression) -> None:
+        subject = expression.children[0] if expression.children else None
+        if (
+            subject is None
+            or subject.type.name != "Result"
+            or len(subject.type.arguments) != 2
+            or len(expression.arms) != 2
+            or {arm.variant for arm in expression.arms} != {"Ok", "Err"}
+        ):
+            self.error(
+                "E_C99_MATCH",
+                "C99 match supports exhaustive Ok/Err matches on Result values",
+                expression.span,
+            )
+        if subject is not None:
+            self.validate_expression(subject)
+        for arm in expression.arms:
+            self.validate_expression(arm.value)
+
+    def _validate_gradient_target(self, function: IRFunction) -> None:
+        if (
+            not function.body
+            or function.body[-1].kind != "return"
+            or function.body[-1].expression is None
+            or any(statement.kind != "let" for statement in function.body[:-1])
+        ):
+            self.error(
+                "E_C99_GRADIENT_BODY",
+                "C99 autodiff targets support local let bindings followed by one return",
+                function.span,
+            )
+        for statement in function.body:
+            if statement.expression is not None:
+                self._validate_gradient_expression(statement.expression)
+
+    def _validate_gradient_expression(self, expression: IRExpression) -> None:
+        kind = expression.kind
+        if kind in {"literal", "identifier"}:
+            if kind == "literal" and expression.type.name not in {
+                "f32",
+                "f64",
+                *_INTEGER_TYPES,
+            }:
+                self.error(
+                    "E_C99_GRADIENT_EXPRESSION",
+                    "C99 autodiff supports numeric literals and local values only",
+                    expression.span,
+                )
+            return
+        if kind == "group":
+            self._validate_gradient_expression(expression.children[0])
+            return
+        if kind == "unary":
+            if expression.value not in {"+", "-"}:
+                self.error(
+                    "E_C99_GRADIENT_EXPRESSION",
+                    f"Unary operator {expression.value!r} is not supported by C99 autodiff",
+                    expression.span,
+                )
+            for child in expression.children:
+                self._validate_gradient_expression(child)
+            return
+        if kind == "binary":
+            if expression.value == "|>":
+                _, target = expression.children
+                callee = (
+                    target.children[0]
+                    if target.kind == "call" and target.children
+                    else target
+                )
+                if (
+                    callee.kind != "identifier"
+                    or callee.value not in {"convert", "mean", "sum", "scale", "subtract"}
+                ):
+                    self.error(
+                        "E_C99_GRADIENT_EXPRESSION",
+                        "C99 autodiff pipelines support only convert, sum, mean, scale, and subtract",
+                        expression.span,
+                    )
+                self._validate_gradient_expression(expression.children[0])
+                if target.kind == "call":
+                    for argument in target.children[1:]:
+                        if not (
+                            callee.value == "convert"
+                            and argument.type.name == "str"
+                        ):
+                            self._validate_gradient_expression(argument)
+                return
+            if expression.value not in {"+", "-", "*", "/"}:
+                self.error(
+                    "E_C99_GRADIENT_EXPRESSION",
+                    f"Binary operator {expression.value!r} is not supported by C99 autodiff",
+                    expression.span,
+                )
+            for child in expression.children:
+                self._validate_gradient_expression(child)
+            return
+        if kind == "call":
+            callee = expression.children[0] if expression.children else None
+            if (
+                callee is None
+                or callee.kind != "identifier"
+                or callee.value not in {"convert", "mean", "sum", "scale", "subtract"}
+            ):
+                self.error(
+                    "E_C99_GRADIENT_EXPRESSION",
+                    "C99 autodiff supports only convert, sum, mean, scale, and subtract calls",
+                    expression.span,
+                )
+                return
+            for index, argument in enumerate(expression.children[1:], start=1):
+                if callee.value == "convert" and index == len(expression.children) - 1:
+                    continue
+                self._validate_gradient_expression(argument)
+            return
+        self.error(
+            "E_C99_GRADIENT_EXPRESSION",
+            f"Expression kind {kind!r} is not supported by C99 autodiff",
             expression.span,
         )
 
@@ -892,6 +1020,10 @@ class _C99Emitter:
                     function.span,
                 )
             self.current_function = None
+        for target_name in sorted(self.gradient_targets):
+            target = self.functions.get(target_name)
+            if target is not None and target.external_abi is None:
+                self._validate_gradient_target(target)
 
     def _new_temp(self, type_: AetherType) -> str:
         name = f"aether_tmp_{self.temp_index}"
@@ -915,6 +1047,8 @@ class _C99Emitter:
 
     def expression(self, expression: IRExpression) -> _CValue:
         kind = expression.kind
+        if kind == "fused_tensor":
+            return self._fused_tensor_expression(expression)
         if kind == "literal":
             return _CValue((), self._literal_code(expression), expression.type)
         if kind == "identifier":
@@ -937,6 +1071,8 @@ class _C99Emitter:
                 child.cleanup,
                 child.temporary,
             )
+        if kind == "match":
+            return self._match_expression(expression)
         if kind == "try":
             operand = self.expression(expression.children[0])
             prelude, name, cleanup = self._materialize(operand)
@@ -1094,6 +1230,72 @@ class _C99Emitter:
             cleanup=tuple(left_cleanup),
         )
 
+    def _match_expression(self, expression: IRExpression) -> _CValue:
+        subject_expression = expression.children[0]
+        subject = self.expression(subject_expression)
+        prelude, subject_name, subject_cleanup = self._materialize(subject)
+        declaration = self._new_temp(expression.type)
+        result_name = declaration.rsplit(" ", 1)[1]
+        prelude.append(f"{declaration};")
+        all_borrowed = all(
+            arm.value.ownership == "borrowed" for arm in expression.arms
+        )
+        for index, arm in enumerate(expression.arms):
+            condition = (
+                f"{subject_name}.is_ok"
+                if arm.variant == "Ok"
+                else f"!{subject_name}.is_ok"
+            )
+            prelude.append(
+                f"if ({condition}) {{"
+                if index == 0
+                else "else {"
+            )
+            if arm.binding is not None and arm.binding != "_":
+                binding_name = _encoded_identifier("aether_v_", arm.binding)
+                arm_payload_type = subject_expression.type.arguments[
+                    0 if arm.variant == "Ok" else 1
+                ]
+                prelude.append(
+                    f"    {self.c_type(arm_payload_type)} {binding_name} = "
+                    f"{subject_name}.value;"
+                )
+            outer_cleanups = self.active_expression_cleanups
+            self.active_expression_cleanups = (*outer_cleanups, *subject_cleanup)
+            try:
+                value = self.expression(arm.value)
+            finally:
+                self.active_expression_cleanups = outer_cleanups
+            prelude.extend("    " + line for line in value.prelude)
+            prelude.append(f"    {result_name} = {value.code};")
+            if (
+                self._contains_frame_buffer(expression.type)
+                and value.ownership == "borrowed"
+                and not all_borrowed
+            ):
+                retain = self._retain_code(result_name, expression.type)
+                if retain:
+                    prelude.append(f"    {retain}")
+            prelude.extend("    " + line for line in value.cleanup)
+            prelude.append("}")
+        owns_result = (
+            self._contains_frame_buffer(expression.type)
+            and not all_borrowed
+        )
+        return _CValue(
+            tuple(prelude),
+            result_name,
+            expression.type,
+            (
+                "owned"
+                if owns_result
+                else "borrowed"
+                if self._contains_frame_buffer(expression.type)
+                else "plain"
+            ),
+            tuple(subject_cleanup),
+        )
+
     def _call_expression(self, expression: IRExpression) -> _CValue:
         callee = expression.children[0]
         if callee.kind == "identifier" and callee.value in {"Ok", "Err"}:
@@ -1223,6 +1425,53 @@ class _C99Emitter:
         for dimension in type_.dimensions:
             size *= dimension
         return size
+
+    def _fused_element_code(self, expression: IRExpression, index: str) -> str:
+        if expression.kind == "literal":
+            return self._literal_code(expression)
+        if expression.kind == "identifier":
+            name = _encoded_identifier("aether_v_", expression.value)
+            if expression.type.name == "Tensor":
+                return f"{name}.data[{index}]"
+            return name
+        if expression.kind == "group":
+            return f"({self._fused_element_code(expression.children[0], index)})"
+        if expression.kind == "unary":
+            operand = self._fused_element_code(expression.children[0], index)
+            code = f"({expression.value}{operand})"
+        elif expression.kind == "binary":
+            left = self._fused_element_code(expression.children[0], index)
+            right = self._fused_element_code(expression.children[1], index)
+            code = f"({left} {expression.value} {right})"
+        else:
+            raise ValueError(
+                f"Unsupported fused tensor expression {expression.kind!r}"
+            )
+        value_type = (
+            expression.type.element_type
+            if expression.type.name == "Tensor"
+            else expression.type
+        )
+        if value_type is None or value_type.name not in {"f32", "f64"}:
+            raise ValueError("Fused tensor expressions require f32 or f64 values")
+        return f"(({_C_TYPES[value_type.name]}){code})"
+
+    def _fused_tensor_expression(self, expression: IRExpression) -> _CValue:
+        root = expression.children[0]
+        result_declaration = self._new_temp(expression.type)
+        result_name = result_declaration.rsplit(" ", 1)[1]
+        length = self._tensor_size(expression.type)
+        index_name = f"aether_i_{self.temp_index}"
+        self.temp_index += 1
+        value_code = self._fused_element_code(root, index_name)
+        prelude = [
+            f"{result_declaration} = {{0}};",
+            f"for (size_t {index_name} = 0; {index_name} < {length}; "
+            f"++{index_name}) {{",
+            f"    {result_name}.data[{index_name}] = {value_code};",
+            "}",
+        ]
+        return _CValue(tuple(prelude), result_name, expression.type)
 
     def _tensor_binary(
         self,
@@ -1362,6 +1611,22 @@ class _C99Emitter:
         lines: list[str],
         next_node: list[int],
     ) -> int | tuple[int, ...]:
+        if expression.kind == "binary" and expression.value == "|>":
+            left, right = expression.children
+            if right.kind == "call" and right.children:
+                callee = right.children[0]
+                arguments = (left, *right.children[1:])
+            else:
+                callee = right
+                arguments = (left,)
+            call = IRExpression(
+                "call",
+                expression.span,
+                expression.type,
+                children=(callee, *arguments),
+                conversion=right.conversion or expression.conversion,
+            )
+            return self._gradient_tape_expression(call, names, lines, next_node)
         if expression.kind == "literal":
             return self._append_gradient_node(
                 lines,
@@ -1466,6 +1731,24 @@ class _C99Emitter:
             if callee.kind != "identifier":
                 raise ValueError("Differentiable calls must use named built-ins")
             name = callee.value
+            if name in {"scale", "subtract"}:
+                if len(expression.children) != 3:
+                    raise ValueError(
+                        f"Autodiff call {name!r} requires two arguments"
+                    )
+                binary = IRExpression(
+                    "binary",
+                    expression.span,
+                    expression.type,
+                    "*" if name == "scale" else "-",
+                    children=expression.children[1:],
+                )
+                return self._gradient_tape_expression(
+                    binary,
+                    names,
+                    lines,
+                    next_node,
+                )
             if name == "convert":
                 operand = self._gradient_tape_expression(
                     expression.children[1], names, lines, next_node
@@ -1754,6 +2037,8 @@ class _C99Emitter:
 
         if name in {"sum", "mean", "max_abs"}:
             source_type = values[0].type
+            element_type = source_type.element_type
+            assert element_type is not None
             count = self._tensor_size(source_type)
             scalar_type = self.c_type(expression.type)
             declaration = self._new_temp(expression.type)
@@ -1761,7 +2046,10 @@ class _C99Emitter:
             i = f"aether_i_{self.temp_index}"
             self.temp_index += 1
             initial = (
-                self._absolute_code(f"{names[0]}.data[0]")
+                self._absolute_code(
+                    f"{names[0]}.data[0]",
+                    element_type.name,
+                )
                 if name == "max_abs"
                 else "0.0"
             )
@@ -1777,7 +2065,7 @@ class _C99Emitter:
             elif name == "mean":
                 prelude.append(f"    {result} += {item};")
             else:
-                absolute = self._absolute_code(item)
+                absolute = self._absolute_code(item, element_type.name)
                 prelude.append(
                     f"    if ({absolute} > {result}) {result} = {absolute};"
                 )
@@ -1826,7 +2114,7 @@ class _C99Emitter:
         if name == "abs" and values[0].type.name != "Tensor":
             return _CValue(
                 tuple(prelude),
-                self._absolute_code(names[0]),
+                self._absolute_code(names[0], values[0].type.name),
                 expression.type,
                 cleanup=tuple(cleanup),
             )
@@ -1860,7 +2148,9 @@ class _C99Emitter:
             prelude.append(f"for (size_t {i} = 0; {i} < {count}; ++{i}) {{")
             if name == "abs":
                 item = f"{names[0]}.data[{i}]"
-                value = self._absolute_code(item)
+                element_type = result_type.element_type
+                assert element_type is not None
+                value = self._absolute_code(item, element_type.name)
             else:
                 left, right = f"{names[0]}.data[{i}]", f"{names[1]}.data[{i}]"
                 comparison = "<" if name == "min" else ">"
@@ -1877,8 +2167,9 @@ class _C99Emitter:
         raise AssertionError(f"unhandled C99 builtin {name}")
 
     @staticmethod
-    def _absolute_code(value: str) -> str:
-        return f"({value} == 0.0 ? 0.0 : ({value} < 0.0 ? -{value} : {value}))"
+    def _absolute_code(value: str, type_name: str) -> str:
+        zero = "0.0f" if type_name == "f32" else "0.0"
+        return f"({value} == {zero} ? {zero} : ({value} < {zero} ? -{value} : {value}))"
 
     @staticmethod
     def _operation_name(operator: str) -> str:
@@ -2173,11 +2464,11 @@ class _C99Emitter:
                         f"    {self.c_type(expression.type)} {temporary} = "
                         f"{value.code};"
                     )
-                    lines.extend("    " + item for item in value.cleanup)
                     if value.ownership == "borrowed":
                         retain = self._retain_code(temporary, expression.type)
                         if retain:
                             lines.append(f"    {retain}")
+                    lines.extend("    " + item for item in value.cleanup)
                     release = self._release_code(name, expression.type)
                     if release:
                         lines.append(f"    {release}")
@@ -2408,8 +2699,11 @@ def emit_c99_module(
     module: IRModule,
     *,
     include_entry_point: bool = False,
+    optimize: bool = True,
 ) -> str:
     """Emit deterministic C99 for the supported checked-scalar subset."""
+    if optimize:
+        module = fuse_elementwise_tensors(module)
     return _C99Emitter(
         module,
         include_entry_point=include_entry_point,
@@ -2419,8 +2713,12 @@ def emit_c99_module(
 def emit_c99_module_units(
     module: IRModule,
     entry_source_path: str,
+    *,
+    optimize: bool = True,
 ) -> tuple[tuple[str, str], ...]:
     """Emit one C99 translation unit per source file in a project."""
+    if optimize:
+        module = fuse_elementwise_tensors(module)
     entry_path = Path(entry_source_path).expanduser().resolve()
     functions_by_path: dict[Path, list[IRFunction]] = {
         Path(source_path).expanduser().resolve(): []

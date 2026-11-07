@@ -42,6 +42,11 @@ representation; the interpreter does not define target-width overflow or C99
 behavior. Calls have a configurable recursion-depth limit. These checks are
 for prototyping and testing, not a sandbox or production runtime.
 
+User-defined type names cannot shadow built-in type names. Although the
+frontend recognizes `char`, `Slice`, `Pool`, and `Id`, their runtime
+representations are not defined in this subset, so semantic analysis rejects
+them with `E_UNSUPPORTED_TYPE`.
+
 ## Lexical rules
 
 - Identifiers begin with a Unicode letter or `_`; subsequent characters may
@@ -162,8 +167,9 @@ linear derived and already-prefixed units. `µ` is an alias for `u`, which is
 the normalized spelling. `kg` is not prefixable; `g` is. Absolute-temperature
 units and angle units are not prefixable, and absolute temperatures cannot be
 composed or exponentiated. The finite unit registry still limits which physical
-dimensions are recognized; tensor autodiff supports only the bounded linear
-unit subset specified in [the tensor-gradient contract](./autodiff-tensor-contract.md).
+dimensions are recognized; tensor autodiff accepts supported input/output
+unit ratios, including affine-temperature and angular conversions, as
+specified in [the tensor-gradient contract](./autodiff-tensor-contract.md).
 
 The current tensor operation contract is:
 
@@ -349,8 +355,8 @@ guarded; other floating-point exceptional behavior follows the target C
 implementation.
 
 The backend reports `CompilationError` diagnostics for unsupported constructs
-instead of silently emitting a substitute. Structs, strings, `match`,
-exponentiation, unsupported built-in forms, effects other than `@ffi`, and
+instead of silently emitting a substitute. Structs, strings, exponentiation,
+unsupported built-in forms, effects other than `@ffi`, and
 non-C extern declarations are not supported. A limited inline scalar `Result`
 subset is described below. The emitter itself does not
 invoke a C compiler or linker or dynamically load libraries.
@@ -376,20 +382,21 @@ The gradient result has the input shape and element type, with unit
 The target body may contain local bindings followed by one final return.
 Supported expressions are numeric literals, names, unary `+`/`-`, scalar and
 tensor `+`, `-`, `*`, `/` within the existing tensor-operation contract,
-`sum(tensor)`, `mean(tensor)`, and explicit linear `convert(value, "unit")`.
-Broadcasting follows the tensor arithmetic rules; tensor/tensor multiplication
-and division are unsupported. Derivatives accumulate in reverse order and
-combine contributions to shared values.
+`sum(tensor)`, `mean(tensor)`, explicit `convert(value, "unit")`, and the
+linear `scale`/`subtract` built-ins, including pipeline forms. Unit conversions
+may be affine-temperature or angular; the conversion offset has zero derivative
+and the multiplier includes any symbolic pi factor. Broadcasting follows the
+tensor arithmetic rules; tensor/tensor multiplication and division are
+unsupported. Derivatives accumulate in reverse order and combine contributions
+to shared values.
 
-The tensor overload rejects affine absolute-temperature and angle inputs or
-results, effects, control flow, indexing, nested user-function calls, implicit
-conversions, and operations without a derivative convention (`abs`, `min`,
-`max`, and `max_abs`). Explicit conversions with affine offsets or symbolic pi
-factors are outside this contract. Division by zero retains the normal runtime
-failure behavior (an interpreter runtime error or a native C trap). Generated
-C99 allocates an invocation-local tape on the heap, checks size overflow and
-allocation failure, copies the gradient to the returned tensor value, and
-frees the tape. Allocation failure traps; no general ownership or
+The tensor overload rejects effects, control flow, indexing, nested
+user-function calls, implicit conversions, and operations without a derivative
+convention (`abs`, `min`, `max`, and `max_abs`). Division by zero retains the
+normal runtime failure behavior (an interpreter runtime error or a native C
+trap). Generated C99 allocates an invocation-local tape on the heap, checks
+size overflow and allocation failure, copies the gradient to the returned
+tensor value, and frees the tape. Allocation failure traps; no general ownership or
 memory-safety guarantee follows. Floating-point overflow, NaN propagation,
 and cross-toolchain bitwise equality are not guaranteed by this prototype.
 For `f32` autodiff, forward values and local derivative contributions are
@@ -531,11 +538,12 @@ functions with an explicit `Result<T, E>` return annotation. `ErrorTag` is one
 of `IoError`, `FsError`, or `NetError`; it is a category marker, not a
 user-defined error payload. The C99 backend supports `Result<T, E>` only when
 `T` is a supported unitless scalar (`bool`, fixed-width integer, `f32`, or
-`f64`), and only for internal Aether functions. It lowers the value to an
-inline tagged C struct; `?` branches to a common function cleanup epilogue,
-preserving the error tag or wrapping the successful value in the enclosing
-`Result`. No effects, FFI crossing, strings, tensors-as-payloads, or C99
-`match` lowering are included in this increment.
+`f64`) or the bounded `FrameBuffer` resource, and only for internal Aether
+functions. It lowers the value to an inline tagged C struct; `?` branches to a
+common function cleanup epilogue, preserving the error tag or wrapping the
+successful value in the enclosing `Result`. Exhaustive `Ok`/`Err` matches are
+lowered for supported payload and result types. No effects, FFI crossing,
+strings, or tensor payloads are included in this increment.
 
 The accepted ownership baseline specifies value semantics, `var` rebinding,
 frame/tape lifetimes, acyclic ARC, optional COW, fail-fast implicit allocation,
