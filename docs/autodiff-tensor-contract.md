@@ -92,7 +92,9 @@ bitwise reproducibility are not promised by this prototype.
 Forward `f64` `sum` and `mean` reductions accumulate sequentially in row-major
 element order, with `f64` precision after each addition. `mean` divides the
 completed sum once by the element count. This avoids Python-version-dependent
-compensated summation and matches generated C99.
+compensated summation and matches generated C99. Interpreter and native tests
+also compare `f64` gradients for `sum`, `mean`, and their shared product on
+cancellation-sensitive inputs in more than one element order.
 
 For `f32` objectives, forward values and local derivative contributions are
 rounded to `f32` at operation boundaries in both the interpreter and C99

@@ -1682,6 +1682,81 @@ int main(void) {
             "3 3 1 1 -1 -1 -2 -2 0.01 0.01 2 2 2 2 1",
         )
 
+    def test_compiled_f64_autodiff_reductions_follow_sequential_sum_order(self) -> None:
+        source = (
+            "fn sum_objective(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn sum_gradient(values: Tensor<f64, [2, 2]>) "
+            "-> Tensor<f64, [2, 2]> {\n"
+            "  return gradient(sum_objective, values);\n"
+            "}\n"
+            "fn mean_objective(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return mean(values);\n"
+            "}\n"
+            "fn mean_gradient(values: Tensor<f64, [2, 2]>) "
+            "-> Tensor<f64, [2, 2]> {\n"
+            "  return gradient(mean_objective, values);\n"
+            "}\n"
+            "fn shared_objective(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  let total = sum(values);\n"
+            "  let average = mean(values);\n"
+            "  return total * average;\n"
+            "}\n"
+            "fn shared_gradient(values: Tensor<f64, [2, 2]>) "
+            "-> Tensor<f64, [2, 2]> {\n"
+            "  return gradient(shared_objective, values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x2 first = {{1e16, 1.0, -1e16, 1.0}};
+    aether_tensor_f64_2x2 second = {{1e16, -1e16, 1.0, 1.0}};
+    aether_tensor_f64_2x2 first_sum =
+        aether_fn_73756d5f6772616469656e74(first);
+    aether_tensor_f64_2x2 first_mean =
+        aether_fn_6d65616e5f6772616469656e74(first);
+    aether_tensor_f64_2x2 first_shared =
+        aether_fn_7368617265645f6772616469656e74(first);
+    aether_tensor_f64_2x2 second_sum =
+        aether_fn_73756d5f6772616469656e74(second);
+    aether_tensor_f64_2x2 second_mean =
+        aether_fn_6d65616e5f6772616469656e74(second);
+    aether_tensor_f64_2x2 second_shared =
+        aether_fn_7368617265645f6772616469656e74(second);
+    for (size_t i = 0; i < 4; ++i) {
+        printf("%.17g %.17g %.17g ", first_sum.data[i],
+            first_mean.data[i], first_shared.data[i]);
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        printf("%.17g %.17g %.17g ", second_sum.data[i],
+            second_mean.data[i], second_shared.data[i]);
+    }
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        first_order = [[1e16, 1.0], [-1e16, 1.0]]
+        second_order = [[1e16, -1e16], [1.0, 1.0]]
+        expected = []
+        for values in (first_order, second_order):
+            gradients = [
+                run_source(source, name, values)
+                for name in ("sum_gradient", "mean_gradient", "shared_gradient")
+            ]
+            expected.extend(
+                gradient[row][column]
+                for row in range(2)
+                for column in range(2)
+                for gradient in gradients
+            )
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual, [1.0, 0.25, 0.5] * 4 + [1.0, 0.25, 1.0] * 4)
+
     def test_compiled_f32_tensor_gradient_chains_shared_reductions_and_units(self) -> None:
         source = (
             "fn objective(values: Tensor<f32, [2]>) -> f32 {\n"

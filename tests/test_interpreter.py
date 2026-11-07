@@ -1128,6 +1128,51 @@ class InterpreterTests(unittest.TestCase):
                 self.assertAlmostEqual(value, 0.0, delta=1e-12)
         self.assertEqual(interpreter.run("single_gradient", [42.0]), [1.0])
 
+    def test_f64_autodiff_reductions_follow_sequential_sum_order(self) -> None:
+        parsed = parse_source(
+            "fn sum_objective(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn sum_gradient(values: Tensor<f64, [2, 2]>) "
+            "-> Tensor<f64, [2, 2]> {\n"
+            "  return gradient(sum_objective, values);\n"
+            "}\n"
+            "fn mean_objective(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return mean(values);\n"
+            "}\n"
+            "fn mean_gradient(values: Tensor<f64, [2, 2]>) "
+            "-> Tensor<f64, [2, 2]> {\n"
+            "  return gradient(mean_objective, values);\n"
+            "}\n"
+            "fn shared_objective(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  let total = sum(values);\n"
+            "  let average = mean(values);\n"
+            "  return total * average;\n"
+            "}\n"
+            "fn shared_gradient(values: Tensor<f64, [2, 2]>) "
+            "-> Tensor<f64, [2, 2]> {\n"
+            "  return gradient(shared_objective, values);\n"
+            "}\n"
+        )
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+        first_order = [[1e16, 1.0], [-1e16, 1.0]]
+        second_order = [[1e16, -1e16], [1.0, 1.0]]
+        sum_expected = [[1.0, 1.0], [1.0, 1.0]]
+        mean_expected = [[0.25, 0.25], [0.25, 0.25]]
+
+        for values, shared_expected in (
+            (first_order, [[0.5, 0.5], [0.5, 0.5]]),
+            (second_order, [[1.0, 1.0], [1.0, 1.0]]),
+        ):
+            with self.subTest(values=values):
+                self.assertEqual(interpreter.run("sum_gradient", values), sum_expected)
+                self.assertEqual(interpreter.run("mean_gradient", values), mean_expected)
+                self.assertEqual(
+                    interpreter.run("shared_gradient", values),
+                    shared_expected,
+                )
+
     def test_f32_mean_gradient_rounds_local_derivative_factor(self) -> None:
         parsed = parse_source(
             "fn objective(values: Tensor<f32, [3]>) -> f32 {\n"

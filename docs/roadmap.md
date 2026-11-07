@@ -37,7 +37,7 @@ or completion of the full Aether vision.
 | 9 | Multi-file modules and project compilation | **Done (restricted subset)** | Relative imports, aliases, cycle checks, project compilation, and per-module C99 translation units are implemented under documented path and visibility rules. Workspace/LSP import resolution and a general package system remain future work. |
 | 10 | Deterministic C99 CPU backend | **Partial** | Checked scalar lowering and the first static floating-tensor subset are implemented. C99 builds disable FP contraction; supported conversion constants are emitted as single hexadecimal literals. `f64` sum/mean use sequential row-major accumulation in the interpreter and C99 backend, covered by order-sensitive tests. Interpreter/C99 parity is covered for selected operations, not promised for every input or target. Unsupported constructs are diagnosed rather than substituted. |
 | 11 | Host builds and artifact manifests | **Done (restricted workflow)** | Object/executable builds, explicit FFI library maps, multi-object workflows, and source/object fingerprint checks exist. Object builds are tested for repeatability across temporary directories; source hashes normalize line endings while parsing preserves original offsets. The manifest detects staleness/tampering but is not a signed security boundary; incremental caching is not implemented. |
-| 12 | Toolchain and CI reproducibility | **Partial / unverified remotely** | All 243 tests pass locally with GCC and Clang using strict C99 flags. The latest GitHub Actions rerun could not allocate runners because the account is locked due to a billing issue; remote CI success must not be inferred from local results. |
+| 12 | Toolchain and CI reproducibility | **Partial / unverified remotely** | All 245 tests pass locally with GCC and Clang using strict C99 flags. The latest GitHub Actions rerun could not allocate runners because the account is locked due to a billing issue; remote CI success must not be inferred from local results. |
 | 13 | Memory and ownership model | **Accepted / bounded ARC implemented** | The accepted baseline defines value semantics, rebinding-only `var`, frame/tape lifetimes, acyclic ARC, optional COW, fail-fast implicit allocation, cleanup on `?`, and explicit transfer for future ownership-bearing FFI. The implemented ARC subset supports retain/release and owned returns for immutable `FrameBuffer` storage, borrowed parameters, temporary owners, and LIFO cleanup in the interpreter and C99 backend. General ARC, COW, heap tensor storage, arbitrary destructors, and ownership-bearing FFI remain unimplemented. |
 | 14 | Tensors, autodiff, fusion, and CUDA | **In progress** | Static shapes, the interpreter tensor contract, C99 CPU tensors, scalar and bounded tensor reverse-mode autodiff v0, and unit-prefix/compound-expression prerequisites are implemented. The C99 `f32` mean-gradient factor is now rounded consistently with the interpreter and covered by GCC/Clang regression tests; broader tensor-backend conformance hardening remains. Operator fusion, CUDA execution, and GPU validation are future work. |
 
@@ -89,6 +89,8 @@ Still open in milestone 14:
    subnormal, with symmetric negative cases. Immediately below and above half
    a subnormal are also tested to establish the zero-to-subnormal transition
    under GCC and Clang.
+   `f64` autodiff tests now check `sum`, `mean`, and their shared product on
+   cancellation-sensitive inputs in both row-major orders.
 6. Specify the scalar `gradient(f, x)` v0 contract: **Done** for unitless
    `f32`/`f64`, pure unary targets, the supported arithmetic expression subset,
    result type, and division-by-zero behavior. The bounded tensor-gradient
@@ -129,7 +131,7 @@ same-shape cases across ranks one through three, but does not exhaust all
 shape/operator/type combinations. Fusion and CUDA remain separate later
 milestones.
 
-The current local verification is **234 tests passing with GCC and 234 with
+The current local verification is **245 tests passing with GCC and 245 with
 Clang**, plus `compileall` and `git diff --check`. This does not substitute for
 remote CI or production qualification.
 
