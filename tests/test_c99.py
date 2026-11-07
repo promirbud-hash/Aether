@@ -1462,6 +1462,43 @@ int main(void) {
                             math.copysign(1.0, reference),
                         )
 
+    def test_f64_reductions_match_sequential_interpreter_order(self) -> None:
+        source = (
+            "fn total(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn average(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return mean(values);\n"
+            "}\n"
+        )
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    aether_tensor_f64_2x2 first = {{1e16, 1.0, -1e16, 1.0}};
+    aether_tensor_f64_2x2 second = {{1e16, -1e16, 1.0, 1.0}};
+    printf("%.17g %.17g %.17g %.17g\n",
+        aether_fn_746f74616c(first),
+        aether_fn_61766572616765(first),
+        aether_fn_746f74616c(second),
+        aether_fn_61766572616765(second));
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = [float(value) for value in result.stdout.split()]
+        first_order = [[1e16, 1.0], [-1e16, 1.0]]
+        second_order = [[1e16, -1e16], [1.0, 1.0]]
+        expected = [
+            run_source(source, "total", first_order),
+            run_source(source, "average", first_order),
+            run_source(source, "total", second_order),
+            run_source(source, "average", second_order),
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual, [1.0, 0.25, 2.0, 0.5])
+
     def test_tensor_division_by_zero_traps(self) -> None:
         source = (
             "fn divide(value: Tensor<f32, [2]>, scalar: f32) "

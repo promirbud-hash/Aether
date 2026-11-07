@@ -216,6 +216,11 @@ rounding after each addition. The reverse-mode forward tape and local
 derivatives use the same `f32` rounding; adjoints accumulate in double
 precision, as in the C99 backend. The interpreter stores numbers as Python
 floats but explicitly rounds them at these `f32` boundaries.
+`f64` reductions also accumulate sequentially in row-major element order,
+rounding each addition to `f64`; `mean` divides the completed sum once by the
+element count. The interpreter uses an explicit loop rather than Python's
+version-dependent compensated floating-point `sum`, keeping its order and
+results aligned with generated C99.
 
 Conformance tests include loss of precision, overflow to infinity, subnormal
 underflow, NaN, infinities, and signed zero for `max_abs`. Tensor division by

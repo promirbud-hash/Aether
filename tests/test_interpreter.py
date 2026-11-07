@@ -359,6 +359,25 @@ class InterpreterTests(unittest.TestCase):
             [2.0, 2.0, 2.0, 2.0],
         )
 
+    def test_f64_reductions_accumulate_sequentially_in_row_major_order(self) -> None:
+        parsed = parse_source(
+            "fn total(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return sum(values);\n"
+            "}\n"
+            "fn average(values: Tensor<f64, [2, 2]>) -> f64 {\n"
+            "  return mean(values);\n"
+            "}\n"
+        )
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(parsed.ast)
+
+        first_order = [[1e16, 1.0], [-1e16, 1.0]]
+        second_order = [[1e16, -1e16], [1.0, 1.0]]
+        self.assertEqual(interpreter.run("total", first_order), 1.0)
+        self.assertEqual(interpreter.run("average", first_order), 0.25)
+        self.assertEqual(interpreter.run("total", second_order), 2.0)
+        self.assertEqual(interpreter.run("average", second_order), 0.5)
+
     def test_reverse_mode_gradient_matches_analytic_scalar_derivative(self) -> None:
         source = (
             "fn objective(x: f64) -> f64 {\n"

@@ -158,6 +158,13 @@ def _flatten(value: object) -> list[object]:
     return [value]
 
 
+def _ordered_f64_sum(values: list[object]) -> float:
+    total = 0.0
+    for value in values:
+        total += float(value)
+    return total
+
+
 def _reshape_flat(values: list[float], shape: tuple[int, ...]) -> object:
     cursor = 0
 
@@ -1193,6 +1200,8 @@ class Interpreter:
                     result = 0.0
                     for item in items:
                         result = _round_f32(result + item)
+                elif expression.type.name == "f64":
+                    result = _ordered_f64_sum(items)
                 else:
                     result = sum(items)
             elif name == "mean":
@@ -1201,6 +1210,8 @@ class Interpreter:
                     for item in items:
                         result = _round_f32(result + item)
                     result = _round_f32(result / len(items))
+                elif expression.type.name == "f64":
+                    result = _ordered_f64_sum(items) / len(items)
                 else:
                     result = sum(items) / len(items)
             else:

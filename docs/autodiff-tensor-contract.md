@@ -89,6 +89,10 @@ Unary `+t` forwards the upstream gradient unchanged; `-t` negates it.
 
 These are mathematical rules; the exact floating-point evaluation order and
 bitwise reproducibility are not promised by this prototype.
+Forward `f64` `sum` and `mean` reductions accumulate sequentially in row-major
+element order, with `f64` precision after each addition. `mean` divides the
+completed sum once by the element count. This avoids Python-version-dependent
+compensated summation and matches generated C99.
 
 For `f32` objectives, forward values and local derivative contributions are
 rounded to `f32` at operation boundaries in both the interpreter and C99
