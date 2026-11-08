@@ -1,0 +1,5 @@
+@target(mcu)
+@C
+fn led_on_for_tick(tick: i32) -> bool {
+    return (tick & 1) == 0;
+}

@@ -31,6 +31,65 @@ from src.interpreter import ResultValue
 
 
 class ProjectTests(unittest.TestCase):
+    def test_native_imported_module_uses_entry_runtime_arguments(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            entry = root / "main.hl"
+            entry.write_text(
+                'import "arguments.hl" as arguments;\n'
+                "fn main() -> i32 { return arguments::has_argument(); }\n",
+                encoding="utf-8",
+            )
+            (root / "arguments.hl").write_text(
+                "fn has_argument() -> i32 {\n"
+                "  return match args_get(args_len() - args_len()) "
+                "{ Ok(_) => 0, Err(_) => 1 };\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            executable = build_project_executable(
+                entry,
+                root / "program",
+                compiler=compiler,
+            )
+            with_argument = subprocess.run(
+                [str(executable), "héllo"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+                cwd=root,
+            )
+            without_argument = subprocess.run(
+                [str(executable)],
+                check=False,
+                capture_output=True,
+                timeout=10,
+                cwd=root,
+            )
+            self.assertEqual(with_argument.returncode, 0, with_argument.stderr)
+            self.assertEqual(without_argument.returncode, 1, without_argument.stderr)
+
+    def test_imported_calls_in_control_flow_are_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            (project / "values.hl").write_text(
+                "fn positive(value: i32) -> bool { return value > 0; }\n",
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "values.hl" as values;\n'
+                "fn main(value: i32) -> i32 {\n"
+                "  if values::positive(value) { return 1; } else { return 0; }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            result = run_project(entry, "main", 4)
+
+        self.assertEqual(result, 1)
+
     def test_imported_var_rebinding_is_preserved_in_project_ir(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project = Path(temporary_directory)
@@ -1172,7 +1231,7 @@ class ProjectTests(unittest.TestCase):
                 )
             self.assertEqual(output.read_bytes(), b"previous executable")
 
-    def test_project_c99_rejects_features_outside_backend_subset(self) -> None:
+    def test_project_c99_passes_imported_struct_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project = Path(temporary_directory)
             (project / "types.hl").write_text(
@@ -1183,22 +1242,27 @@ class ProjectTests(unittest.TestCase):
             entry = project / "main.hl"
             entry.write_text(
                 'import "types.hl" as types;\n'
-                "fn main() -> i32 { return 0; }\n",
+                "fn main() -> i32 {\n"
+                "  let point = types::Point { x: 7 };\n"
+                "  return types::identity(point).x;\n"
+                "}\n",
                 encoding="utf-8",
             )
 
-            with self.assertRaises(CompilationError) as raised:
-                emit_c99_project(entry)
-
-        diagnostic = next(
-            item
-            for item in raised.exception.diagnostics
-            if item.code == "E_C99_TYPE_DECL"
-        )
-        self.assertEqual(
-            diagnostic.span.source_path,
-            str((project / "types.hl").resolve()),
-        )
+            executable = project / "program.exe"
+            build_project_executable(
+                entry,
+                executable,
+                compiler=self.compiler(),
+            )
+            result = subprocess.run(
+                [str(executable)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+                cwd=project,
+            )
+            self.assertEqual(result.returncode, 7, result.stderr)
 
     def test_project_executable_links_entry_module_c_abi_library(self) -> None:
         compiler = self.compiler()
@@ -1616,11 +1680,70 @@ class ProjectTests(unittest.TestCase):
             {diagnostic.code for diagnostic in raised.exception.diagnostics},
         )
 
-    def test_project_rejects_imported_extern_declarations(self) -> None:
+    def test_project_links_imported_extern_and_injects_interpreter_handler(self) -> None:
+        compiler = self.compiler()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project = Path(temporary_directory)
+            library_source = project / "native.hl"
+            library_source.write_text(
+                '@ffi @link("sensor") extern "C" fn read() -> i32;\n',
+                encoding="utf-8",
+            )
+            entry = project / "main.hl"
+            entry.write_text(
+                'import "native.hl" as native;\n'
+                "@ffi fn main() -> i32 { return native::read(); }\n",
+                encoding="utf-8",
+            )
+            library_object = project / "sensor.o"
+            compile_c99_object(
+                "#include <stdint.h>\nint32_t read(void) { return 73; }\n",
+                library_object,
+                compiler=compiler,
+            )
+
+            module = compile_project(entry)
+            imported_extern = next(
+                function
+                for function in module.functions
+                if function.external_abi == "C"
+            )
+            self.assertTrue(imported_extern.name.startswith("$module:"))
+            self.assertEqual(imported_extern.external_symbol, "read")
+            self.assertEqual(imported_extern.external_library, "sensor")
+
+            with self.assertRaises(C99LinkConfigurationError):
+                build_project_executable(
+                    entry,
+                    project / "missing.exe",
+                    compiler=compiler,
+                )
+            executable = build_project_executable(
+                entry,
+                project / "program.exe",
+                compiler=compiler,
+                libraries={"sensor": library_object},
+            )
+            result = subprocess.run(
+                [str(executable)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            interpreted = run_project(
+                entry,
+                "main",
+                external_handlers={"sensor:read": lambda: 73},
+            )
+
+        self.assertEqual(result.returncode, interpreted, result.stderr)
+        self.assertEqual(interpreted, 73)
+
+    def test_imported_extern_effect_propagates_to_project_callers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             project = Path(temporary_directory)
             (project / "native.hl").write_text(
-                '@ffi @link("native") extern "C" fn read() -> i32;\n',
+                '@ffi @link("sensor") extern "C" fn read() -> i32;\n',
                 encoding="utf-8",
             )
             entry = project / "main.hl"
@@ -1629,12 +1752,11 @@ class ProjectTests(unittest.TestCase):
                 "fn main() -> i32 { return native::read(); }\n",
                 encoding="utf-8",
             )
-
             with self.assertRaises(CompilationError) as raised:
                 compile_project(entry)
 
         self.assertIn(
-            "E_PROJECT_FFI_UNSUPPORTED",
+            "E_EFFECT_VIOLATION",
             {diagnostic.code for diagnostic in raised.exception.diagnostics},
         )
 

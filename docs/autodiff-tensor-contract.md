@@ -99,6 +99,9 @@ completed sum once by the element count. This avoids Python-version-dependent
 compensated summation and matches generated C99. Interpreter and native tests
 also compare `f64` gradients for `sum`, `mean`, and their shared product on
 cancellation-sensitive inputs in more than one element order.
+The f64 scalar quotient derivative is also compared with its analytic value
+and the interpreter for positive, negative, very small, and very large
+nonzero denominators under GCC and Clang.
 
 For `f32` objectives, forward values and local derivative contributions are
 rounded to `f32` at operation boundaries in both the interpreter and C99
@@ -151,7 +154,9 @@ A rectangular `f32` `[2,3]` shared-mean product and an `f64` `[2,1,2,2]`
 shared-mean division cover rank/type combinations missing from the prior
 matrix; both are checked against analytic results in the interpreter and
 compiled C99.
-Other tests cover tensor and scalar division gradients, a shared branch near the
+Other tests cover f32 scalar and tensor division gradients and f64 tensor
+division gradients. The f64 scalar quotient case additionally checks direct
+scalar division across denominator magnitudes. A shared branch near the
 `f32` integer precision boundary, subnormal scalar and tensor gradients, and
 gradients that overflow to positive infinity. Coverage includes a shared
 scaled tensor value used by both `sum` and `mean` and explicit linear unit
@@ -208,6 +213,31 @@ fn derivative(values: Tensor<f32, [2]>) -> Tensor<f32, [2]> {
 ```
 
 For finite values, the intended result is element-wise `2 * values`.
+
+## Differential-test coverage and known gaps
+
+The current interpreter/C99 comparisons cover the documented v0 arithmetic,
+broadcasting, reduction, unit-conversion, cancellation, and selected
+floating-point boundary cases. Native tests run under GCC and Clang at the
+optimization levels named by their test cases. The conditional MSVC C99
+comparison runs only when `cl.exe` is available; it is not evidence of MSVC
+coverage in environments where that test is skipped.
+
+No additional autodiff implementation change is justified without a measured
+interpreter/C99 mismatch. The following cases are intentionally unsupported by
+the current differentiable subset, rather than claimed as parity gaps:
+
+- Control flow and nested user-function calls.
+- Indexing, tensor/tensor multiplication or division, and dynamic shapes.
+- Nonsmooth `abs`, `min`, `max`, and `max_abs`, which have no v0 derivative
+  convention.
+- Exhaustive combinations of tensor ranks, shapes, precisions, operators,
+  exceptional values, rounding modes, and compiler targets.
+
+When extending the contract, add only a concrete uncovered case with an
+analytic expectation and compare the interpreter with generated C99 under
+available GCC and Clang toolchains. Keep unavailable compiler checks,
+including MSVC, reported separately from passes.
 
 ## Explicitly deferred
 

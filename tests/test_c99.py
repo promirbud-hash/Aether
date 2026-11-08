@@ -15,7 +15,9 @@ from src.api import (
     build_object,
     compile_source,
     emit_c99,
+    emit_c99_header,
     run_source,
+    write_c99_header,
 )
 from src.build import (
     C99BuildError,
@@ -25,7 +27,7 @@ from src.build import (
 )
 from src.c99 import emit_c99_module
 from src.c99 import C99LoweringError
-from src.interpreter import Quantity, ResultValue
+from src.interpreter import AetherRuntimeError, Quantity, ResultValue
 from src.ir import IRExpression, IRMatchArm
 from src.semantic import AetherType
 
@@ -34,6 +36,611 @@ _STRICT_C99_FLAGS = ("-std=c99", "-pedantic", "-Wall", "-Wextra", "-Werror")
 
 
 class C99BackendTests(unittest.TestCase):
+    def test_c99_compiles_checked_collection_access_and_list_mutation(self) -> None:
+        source = (
+            "fn check() -> i32 {\n"
+            "  var values: List<i32> = List([1, 2, 3]);\n"
+            "  let changed = match append(values, 4) {\n"
+            "    Ok(_) => 0, Err(_) => -10,\n"
+            "  };\n"
+            "  let first = match get(values, 0) {\n"
+            "    Ok(value) => value, Err(_) => -20,\n"
+            "  };\n"
+            "  return changed + first;\n"
+            "}\n"
+            "fn count() -> i64 {\n"
+            "  let values: Array<i32, [2]> = [4, 5];\n"
+            "  return len(values);\n"
+            "}\n"
+        )
+        generated = emit_c99_module(compile_source(source))
+        self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  return aether_fn_636865636b() == 1 && "
+            "aether_fn_636f756e74() == 2 ? 0 : 1;\n"
+            "}\n",
+        )
+
+    def test_c99_compiles_collection_returns_scopes_and_remaining_operations(self) -> None:
+        source = (
+            "fn mutate() -> i32 {\n"
+            "  var values: List<i32> = List([1, 2, 3]);\n"
+            "  let original = values;\n"
+            "  let set_result = match set(values, 0, 9) { Ok(_) => 0, Err(_) => -1 };\n"
+            "  let insert_result = match insert(values, 1, 8) { Ok(_) => 0, Err(_) => -2 };\n"
+            "  let remove_result = match remove(values, 0) { Ok(value) => value, Err(_) => -3 };\n"
+            "  let pop_result = match pop(values) { Ok(value) => value, Err(_) => -4 };\n"
+            "  let old_value = match get(original, 0) { Ok(value) => value, Err(_) => -5 };\n"
+            "  return set_result + insert_result + remove_result + pop_result + old_value;\n"
+            "}\n"
+            "fn fixed_array() -> i32 {\n"
+            "  var values: Array<i32, [2]> = [4, 5];\n"
+            "  let changed = match set(values, 1, 7) { Ok(_) => 0, Err(_) => -1 };\n"
+            "  let result = match get(values, 1) { Ok(value) => value, Err(_) => -2 };\n"
+            "  return changed + result;\n"
+            "}\n"
+            "fn identity(values: List<i32>) -> List<i32> { return values; }\n"
+            "fn returned() -> List<i32> {\n"
+            "  let values: List<i32> = List([4, 5]);\n"
+            "  return identity(values);\n"
+            "}\n"
+            "fn returned_value() -> i32 {\n"
+            "  let values = returned();\n"
+            "  return match get(values, 1) { Ok(value) => value, Err(_) => -1 };\n"
+            "}\n"
+            "fn owned_slice() -> Result<Slice<i32>, CollectionError> {\n"
+            "  let values: Array<i32, [3]> = [4, 5, 6];\n"
+            "  return slice(values, 1, 3);\n"
+            "}\n"
+            "fn read_slice(values: Slice<i32>) -> i32 {\n"
+            "  return match get(values, 0) { Ok(value) => value, Err(_) => -1 };\n"
+            "}\n"
+            "fn slice_value() -> i32 {\n"
+            "  let values = owned_slice();\n"
+            "  return match values { Ok(value) => read_slice(value), Err(_) => -1 };\n"
+            "}\n"
+            "fn scoped_loop() -> i32 {\n"
+            "  var index = 0;\n"
+            "  while index < 2 {\n"
+            "    let values: List<i32> = List([index]);\n"
+            "    index += 1;\n"
+            "  }\n"
+            "  return index;\n"
+            "}\n"
+        )
+        self.assertEqual(run_source(source, "mutate"), 13)
+        self.assertEqual(run_source(source, "fixed_array"), 7)
+        self.assertEqual(run_source(source, "returned_value"), 5)
+        self.assertEqual(run_source(source, "slice_value"), 5)
+        self.assertEqual(run_source(source, "scoped_loop"), 2)
+        generated = emit_c99_module(compile_source(source))
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  return aether_fn_6d7574617465() == 13 && "
+            "aether_fn_66697865645f6172726179() == 7 && "
+            "aether_fn_72657475726e65645f76616c7565() == 5 && "
+            "aether_fn_736c6963655f76616c7565() == 5 && "
+            "aether_fn_73636f7065645f6c6f6f70() == 2 ? 0 : 1;\n"
+            "}\n",
+        )
+        try:
+            result = self.run_program(executable)
+        except OSError as error:
+            if os.name == "nt" and getattr(error, "winerror", None) == 225:
+                self.skipTest(
+                    "Windows Defender blocked execution of the generated test binary"
+                )
+            raise
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_native_console_and_process_argument_runtime(self) -> None:
+        source = (
+            "@io\n"
+            "fn echo(value: str) -> Result<void, IoError> { return io_write(value); }\n"
+            "fn argument(index: i64) -> Result<str, ArgsError> { return args_get(index); }\n"
+            "fn count() -> i64 { return args_len(); }\n"
+        )
+        generated = emit_c99_module(compile_source(source))
+        executable = self.compile_program(
+            generated,
+            "int main(int argc, char **argv) {\n"
+            "  if (!aether_runtime_init(argc, argv)) return 90;\n"
+            "  if (aether_fn_636f756e74() != (int64_t)(argc - 1)) return 91;\n"
+            "  aether_result_str_ArgsError argument = aether_fn_617267756d656e74(0);\n"
+            "  if (argc < 2) return argument.is_ok ? 92 : argument.error == 1 ? 0 : 93;\n"
+            "  if (!argument.is_ok) return 94;\n"
+            "  if (argument.value.length != 6u) return 95;\n"
+            "  aether_result_void_IoError written = aether_fn_6563686f(argument.value);\n"
+            "  return written.is_ok ? 0 : 96;\n"
+            "}\n",
+        )
+
+        with_argument = subprocess.run(
+            [str(executable), "héllo"],
+            capture_output=True,
+            check=False,
+            timeout=10,
+            cwd=executable.parent,
+        )
+        no_argument = subprocess.run(
+            [str(executable)],
+            capture_output=True,
+            check=False,
+            timeout=10,
+            cwd=executable.parent,
+        )
+        self.assertEqual(with_argument.returncode, 0, with_argument.stderr)
+        self.assertEqual(with_argument.stdout, "héllo".encode("utf-8"))
+        self.assertEqual(no_argument.returncode, 0, no_argument.stderr)
+
+    def test_native_console_reads_utf8_and_reports_eof_and_invalid_encoding(self) -> None:
+        source = (
+            "@io\n"
+            "fn read() -> Result<str, IoError> { return io_read_line(); }\n"
+        )
+        generated = emit_c99_module(compile_source(source))
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  aether_result_str_IoError result = aether_fn_72656164();\n"
+            "  if (!result.is_ok) return result.error;\n"
+            "  if (fwrite(result.value.data, 1u, result.value.length, stdout) != result.value.length) return 11;\n"
+            "  return 0;\n"
+            "}\n",
+        )
+
+        valid = subprocess.run(
+            [str(executable)],
+            input="žluťoučký\n".encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=10,
+            cwd=executable.parent,
+        )
+        eof = subprocess.run(
+            [str(executable)],
+            input=b"",
+            capture_output=True,
+            check=False,
+            timeout=10,
+            cwd=executable.parent,
+        )
+        invalid = subprocess.run(
+            [str(executable)],
+            input=b"\xff\n",
+            capture_output=True,
+            check=False,
+            timeout=10,
+            cwd=executable.parent,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stderr.decode(errors="replace"))
+        self.assertEqual(valid.stdout, "žluťoučký".encode("utf-8"))
+        self.assertEqual(eof.returncode, 1, eof.stderr.decode(errors="replace"))
+        self.assertEqual(invalid.returncode, 2, invalid.stderr.decode(errors="replace"))
+
+    def test_native_filesystem_runtime_and_stable_error_codes(self) -> None:
+        read_source = (
+            "@fs\n"
+            "fn read(path: str) -> Result<str, FsError> { return fs_read_text(path); }\n"
+        )
+        generated = emit_c99_module(compile_source(read_source))
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  aether_result_str_FsError result = aether_fn_72656164("
+            "((aether_string){(const unsigned char *)\"data.txt\", 8u}));\n"
+            "  if (!result.is_ok) return result.error;\n"
+            "  if (fwrite(result.value.data, 1u, result.value.length, stdout) != result.value.length) return 11;\n"
+            "  return 0;\n"
+            "}\n",
+        )
+        (executable.parent / "data.txt").write_bytes("zażółć".encode("utf-8"))
+        success = subprocess.run(
+            [str(executable)],
+            capture_output=True,
+            check=False,
+            timeout=10,
+            cwd=executable.parent,
+        )
+        (executable.parent / "data.txt").write_bytes(b"\xff")
+        invalid_utf8 = self.run_program(executable)
+        (executable.parent / "data.txt").unlink()
+        missing = self.run_program(executable)
+        self.assertEqual(success.returncode, 0, success.stderr)
+        self.assertEqual(success.stdout, "zażółć".encode("utf-8"))
+        self.assertEqual(invalid_utf8.returncode, 3, invalid_utf8.stderr)
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+
+        path_error_source = (
+            "@fs\n"
+            "fn read(path: str) -> Result<str, FsError> { return fs_read_text(path); }\n"
+        )
+        path_error = self.compile_program(
+            emit_c99_module(compile_source(path_error_source)),
+            "int main(void) {\n"
+            "  aether_result_str_FsError result = aether_fn_72656164("
+            "((aether_string){(const unsigned char *)\"../outside.txt\", 14u}));\n"
+            "  return result.is_ok ? 90 : result.error;\n"
+            "}\n",
+        )
+        self.assertEqual(self.run_program(path_error).returncode, 2)
+
+    def test_native_filesystem_write_success_and_missing_parent_error(self) -> None:
+        source = (
+            "@fs\n"
+            "fn write(path: str, text: str) -> Result<void, FsError> {\n"
+            "  return fs_write_text(path, text);\n"
+            "}\n"
+        )
+        executable = self.compile_program(
+            emit_c99_module(compile_source(source)),
+            "int main(void) {\n"
+            "  aether_result_void_FsError result = aether_fn_7772697465("
+            "((aether_string){(const unsigned char *)\"created.txt\", 11u}), "
+            "((aether_string){(const unsigned char *)\"héllo\", 6u}));\n"
+            "  return result.is_ok ? 0 : result.error;\n"
+            "}\n",
+        )
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (executable.parent / "created.txt").read_bytes(),
+            "héllo".encode("utf-8"),
+        )
+
+        missing_parent = self.compile_program(
+            emit_c99_module(compile_source(source)),
+            "int main(void) {\n"
+            "  aether_result_void_FsError result = aether_fn_7772697465("
+            "((aether_string){(const unsigned char *)\"missing/child.txt\", 17u}), "
+            "((aether_string){(const unsigned char *)\"x\", 1u}));\n"
+            "  return result.is_ok ? 90 : result.error;\n"
+            "}\n",
+        )
+        self.assertEqual(self.run_program(missing_parent).returncode, 1)
+
+    def test_native_filesystem_exists_distinguishes_missing_from_invalid_path(self) -> None:
+        source = (
+            "@fs\n"
+            "fn exists(path: str) -> Result<bool, FsError> { return fs_exists(path); }\n"
+        )
+        executable = self.compile_program(
+            emit_c99_module(compile_source(source)),
+            "int main(void) {\n"
+            "  aether_result_bool_FsError missing = aether_fn_657869737473("
+            "((aether_string){(const unsigned char *)\"missing.txt\", 11u}));\n"
+            "  aether_result_bool_FsError invalid = aether_fn_657869737473("
+            "((aether_string){(const unsigned char *)\"../outside.txt\", 14u}));\n"
+            "  return !missing.is_ok || missing.value || invalid.is_ok || invalid.error != 2;\n"
+            "}\n",
+        )
+        self.assertEqual(self.run_program(executable).returncode, 0)
+
+    def test_integer_bitwise_operations_and_base_literals(self) -> None:
+        source = (
+            "fn combine(value: i32, shift: i32) -> i32 {\n"
+            "  return (value & 0x0f) | (value ^ 0b1010_0001) "
+            "| ((value << shift) & 0xff);\n"
+            "}\n"
+            "fn invert(value: i32) -> i32 { return ~value; }\n"
+            "fn signed_shift(value: i32, shift: i32) -> i32 {\n"
+            "  return value >> shift;\n"
+            "}\n"
+        )
+        generated = emit_c99(source)
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  if (aether_fn_636f6d62696e65(13, 2) != 189) return 1;\n"
+            "  if (aether_fn_696e76657274(15) != -16) return 2;\n"
+            "  if (aether_fn_7369676e65645f7368696674(-16, 2) != -4) return 3;\n"
+            "  return 0;\n"
+            "}\n",
+        )
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_mcu_target_emits_freestanding_trap_and_rejects_host_runtime(self) -> None:
+        source = (
+            "@target(mcu)\n"
+            "fn add(left: i32, right: i32) -> i32 { return left + right; }\n"
+        )
+        generated = emit_c99(source)
+        self.assertIn("#ifndef AETHER_TRAP", generated)
+        self.assertIn("AETHER_TRAP();", generated)
+        self.assertNotIn("#include <stdlib.h>", generated)
+        self.assertNotIn("abort()", generated)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            object_path = Path(temporary_directory) / "mcu.o"
+            build_object(source, object_path, compiler=self.compiler())
+            self.assertTrue(object_path.is_file())
+
+        trap_prefix = (
+            "#include <stdlib.h>\n"
+            "static void aether_test_trap(void) { exit(73); }\n"
+            "#define AETHER_TRAP() aether_test_trap()\n"
+        )
+        trap_executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  (void)aether_fn_616464(2147483647, 1);\n"
+            "  return 0;\n"
+            "}\n",
+            prefix=trap_prefix,
+        )
+        trap_result = self.run_program(trap_executable)
+        self.assertEqual(trap_result.returncode, 73, trap_result.stderr)
+
+        hosted_operation = (
+            "@target(mcu)\n"
+            "@io\n"
+            "fn read() -> Result<str, IoError> { return io_read_line(); }\n"
+        )
+        with self.assertRaises(CompilationError) as raised:
+            emit_c99(hosted_operation)
+        self.assertIn(
+            "E_C99_TARGET_RUNTIME",
+            {item.code for item in raised.exception.diagnostics},
+        )
+
+        allocation = (
+            "@target(mcu)\n"
+            "fn allocate(size: u64) -> FrameBuffer { return frame_buffer(size); }\n"
+        )
+        with self.assertRaises(CompilationError) as raised:
+            emit_c99(allocation)
+        self.assertIn(
+            "E_C99_TARGET_ALLOCATION",
+            {item.code for item in raised.exception.diagnostics},
+        )
+
+        dynamic_collection = (
+            "@target(mcu)\n"
+            "fn count(values: List<i32>) -> i64 { return len(values); }\n"
+        )
+        with self.assertRaises(CompilationError) as raised:
+            emit_c99(dynamic_collection)
+        self.assertIn(
+            "E_C99_TARGET_ALLOCATION",
+            {item.code for item in raised.exception.diagnostics},
+        )
+
+        unsupported_tensor = (
+            "@target(mcu)\n"
+            "fn total(values: Tensor<i64, [2]>) -> i64 { return sum(values); }\n"
+        )
+        with self.assertRaises(CompilationError) as raised:
+            emit_c99(unsupported_tensor)
+        self.assertIn(
+            "E_C99_TYPE",
+            {item.code for item in raised.exception.diagnostics},
+        )
+
+        embedded_ffi = (
+            "@target(mcu)\n"
+            '@ffi @link("sensor") extern "C" fn transfer('
+            "bytes: Slice<u8>) -> i32;\n"
+            '@ffi @link("sensor") extern "C" fn update('
+            "bytes: SliceMut<u8>) -> void;\n"
+            "@ffi fn send(bytes: Tensor<u8, [3]>) -> i32 {\n"
+            "  return transfer(bytes);\n"
+            "}\n"
+            "@ffi fn mutate(bytes: Tensor<u8, [3]>) -> void {\n"
+            "  var writable = bytes;\n"
+            "  update(writable);\n"
+            "}\n"
+            "fn total_i8(values: Tensor<i8, [3]>) -> i8 { return sum(values); }\n"
+            "fn total(values: Tensor<i16, [3]>) -> i16 { return sum(values); }\n"
+            "fn total_i32(values: Tensor<i32, [3]>) -> i32 { return sum(values); }\n"
+        )
+        freestanding = emit_c99(embedded_ffi)
+        self.assertIn("extern int32_t transfer(const uint8_t", freestanding)
+        self.assertIn("size_t aether_v_6279746573_len", freestanding)
+        self.assertIn("extern void update(uint8_t *", freestanding)
+        self.assertIn("aether_tensor_i16_3", freestanding)
+        self.assertNotIn("#include <stdlib.h>", freestanding)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            object_path = Path(temporary_directory) / "embedded-ffi.o"
+            build_object(embedded_ffi, object_path, compiler=self.compiler())
+            self.assertTrue(object_path.is_file())
+
+    def test_pico_sdk_example_generates_and_compiles_host_logic(self) -> None:
+        example = Path(__file__).parents[1] / "examples" / "embedded" / "pico"
+        source = (example / "led_logic.hl").read_text(encoding="utf-8")
+        generated = emit_c99(source)
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  if (!led_on_for_tick(0)) return 1;\n"
+            "  if (led_on_for_tick(1)) return 2;\n"
+            "  return 0;\n"
+            "}\n",
+        )
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_integer_tensors_support_arithmetic_reductions_and_indexing(self) -> None:
+        source = (
+            "fn plus(left: Tensor<i8, [3]>, right: Tensor<i8, [3]>) "
+            "-> Tensor<i8, [3]> { return left + right; }\n"
+            "fn total(values: Tensor<i16, [3]>) -> i16 { return sum(values); }\n"
+            "fn average(values: Tensor<i32, [3]>) -> f32 { return mean(values); }\n"
+            "fn largest(values: Tensor<i32, [3]>) -> i32 { return max_abs(values); }\n"
+            "fn item(values: Tensor<i8, [3]>, index: i32) -> i8 {\n"
+            "  return values[index];\n"
+            "}\n"
+        )
+        generated = emit_c99(source)
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  aether_tensor_i8_3 left = {{1, 2, 3}};\n"
+            "  aether_tensor_i8_3 right = {{4, 5, 6}};\n"
+            "  aether_tensor_i8_3 sum = aether_fn_706c7573(left, right);\n"
+            "  aether_tensor_i16_3 values16 = {{1, 2, 3}};\n"
+            "  aether_tensor_i32_3 values32 = {{-2, 3, 4}};\n"
+            "  if (sum.data[0] != 5 || sum.data[1] != 7 || sum.data[2] != 9) return 1;\n"
+            "  if (aether_fn_746f74616c(values16) != 6) return 2;\n"
+            "  if (aether_fn_61766572616765(values32) != 1.6666666f) return 3;\n"
+            "  if (aether_fn_6c617267657374(values32) != 4) return 4;\n"
+            "  if (aether_fn_6974656d(left, 1) != 2) return 5;\n"
+            "  return 0;\n"
+            "}\n",
+        )
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        self.assertEqual(
+            run_source(source, "plus", [1, 2, 3], [4, 5, 6]),
+            [5, 7, 9],
+        )
+        self.assertEqual(run_source(source, "total", [1, 2, 3]), 6)
+        self.assertAlmostEqual(run_source(source, "average", [-2, 3, 4]), 5 / 3)
+        self.assertEqual(run_source(source, "largest", [-2, 3, 4]), 4)
+        self.assertEqual(run_source(source, "item", [1, 2, 3], 1), 2)
+    def test_control_flow_matches_interpreter_in_c99(self) -> None:
+        source = (
+            "fn total(limit: i32) -> i32 {\n"
+            "  var result = 0;\n"
+            "  for index in 0..limit {\n"
+            "    if index == 2 { continue; }\n"
+            "    if index == 5 { break; }\n"
+            "    result += index;\n"
+            "  }\n"
+            "  return result;\n"
+            "}\n"
+            "fn select(flag: bool) -> i32 {\n"
+            "  if flag { return 11; } else { return 22; }\n"
+            "}\n"
+            "fn while_total() -> i32 {\n"
+            "  var index = 0;\n"
+            "  var result = 0;\n"
+            "  while index < 6 {\n"
+            "    index += 1;\n"
+            "    if index == 2 { continue; }\n"
+            "    if index == 5 { break; }\n"
+            "    result += index;\n"
+            "  }\n"
+            "  return result;\n"
+            "}\n"
+        )
+        generated = emit_c99(source)
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  return aether_fn_746f74616c(10) == 8 &&\n"
+            "      aether_fn_746f74616c(0) == 0 &&\n"
+            "      aether_fn_73656c656374(1) == 11 &&\n"
+            "      aether_fn_73656c656374(0) == 22 &&\n"
+            "      aether_fn_7768696c655f746f74616c() == 8 ? 0 : 1;\n"
+            "}\n",
+        )
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_slice_ffi_expands_byte_tensors_to_pointer_and_length(self) -> None:
+        source = (
+            '@ffi @link("native") extern "C" fn inspect_bytes('
+            "bytes: Slice<u8>) -> i32;\n"
+            '@ffi @link("native") extern "C" fn update_bytes('
+            "bytes: SliceMut<u8>) -> void;\n"
+            "@ffi fn submit(bytes: Tensor<u8, [3]>) -> i32 {\n"
+            "  return inspect_bytes(bytes);\n"
+            "}\n"
+            "@ffi fn mutate(bytes: Tensor<u8, [3]>) -> Tensor<u8, [3]> {\n"
+            "  var buffer = bytes;\n"
+            "  update_bytes(buffer);\n"
+            "  return buffer;\n"
+            "}\n"
+        )
+        generated = emit_c99(source)
+        harness = r"""
+int32_t inspect_bytes(const uint8_t *bytes, size_t length) {
+    return length == 3 && bytes[0] == 1 && bytes[1] == 2 && bytes[2] == 3 ? 0 : 1;
+}
+void update_bytes(uint8_t *bytes, size_t length) {
+    if (length == 3) bytes[1] = 9;
+}
+int main(void) {
+    aether_tensor_u8_3 input = {{1, 2, 3}};
+    if (aether_fn_7375626d6974(input) != 0) return 1;
+    aether_tensor_u8_3 output = aether_fn_6d7574617465(input);
+    return output.data[1] == 9 ? 0 : 2;
+}
+"""
+        result = self.compile_and_run(generated, harness)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_c_export_header_compiles_and_links_public_symbol(self) -> None:
+        source = (
+            "fn helper(left: i32, right: i32) -> i32 { return left + right; }\n"
+            "@C fn add(left: i32, right: i32) -> i32 {\n"
+            "  return helper(left, right);\n"
+            "}\n"
+        )
+        header = emit_c99_header(source)
+        self.assertIn("int32_t add(int32_t", header)
+        self.assertNotIn("helper(", header)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            header_path = write_c99_header(source, directory / "aether.h")
+            self.assertEqual(header_path.read_text(encoding="utf-8"), header)
+            c_source = (
+                '#include "aether.h"\n'
+                + emit_c99(source)
+                + "\nint main(void) { return add(19, 23) == 42 ? 0 : 1; }\n"
+            )
+            source_path = directory / "program.c"
+            executable_path = directory / "program"
+            source_path.write_text(c_source, encoding="utf-8")
+            result = subprocess.run(
+                [
+                    *self.compiler(),
+                    *_STRICT_C99_FLAGS,
+                    "-I",
+                    str(directory),
+                    str(source_path),
+                    "-o",
+                    str(executable_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"C99 compilation failed:\n{result.stdout}\n{result.stderr}",
+            )
+            execution = self.run_program(executable_path)
+            self.assertEqual(
+                execution.returncode,
+                0,
+                execution.stdout + execution.stderr,
+            )
+
+    def test_compound_assignment_matches_interpreter_in_c99(self) -> None:
+        source = (
+            "fn update(value: i32) -> i32 {\n"
+            "  var current = value;\n"
+            "  current += 2;\n"
+            "  current -= 1;\n"
+            "  current *= 3;\n"
+            "  current /= 2;\n"
+            "  return current;\n"
+            "}\n"
+        )
+        generated = emit_c99(source)
+        executable = self.compile_program(
+            generated,
+            "int main(void) { return aether_fn_757064617465(4) == 7 ? 0 : 1; }\n",
+        )
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_frame_resources_cleanup_lifo_on_return_and_question_error(self) -> None:
         source = (
             "fn inner(size: u64) -> u64 {\n"
@@ -2418,6 +3025,49 @@ int main(void) {
             ],
         )
 
+    def test_compiled_f64_scalar_autodiff_division_gradients(self) -> None:
+        source = (
+            "fn objective(divisor: f64) -> f64 {\n"
+            "  let square = divisor * divisor;\n"
+            "  return square / divisor;\n"
+            "}\n"
+            "fn derivative(divisor: f64) -> f64 {\n"
+            "  return gradient(objective, divisor);\n"
+            "}\n"
+        )
+        inputs = (2.0, -2.0, 1e-100, 1e100)
+        harness = r"""
+#include <stdio.h>
+int main(void) {
+    printf("%.17g %.17g %.17g %.17g\n",
+        aether_fn_64657269766174697665(2.0),
+        aether_fn_64657269766174697665(-2.0),
+        aether_fn_64657269766174697665(1e-100),
+        aether_fn_64657269766174697665(1e100));
+    return 0;
+}
+"""
+        executable = self.compile_program(emit_c99(source), harness)
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        native = [float(value) for value in result.stdout.split()]
+
+        self.assertEqual(len(native), len(inputs))
+        for value, actual in zip(inputs, native):
+            analytic = 1.0
+            interpreted = run_source(source, "derivative", value)
+            with self.subTest(divisor=value):
+                self.assertAlmostEqual(
+                    interpreted,
+                    analytic,
+                    delta=max(abs(analytic) * 1e-12, 1e-300),
+                )
+                self.assertAlmostEqual(
+                    actual,
+                    interpreted,
+                    delta=max(abs(interpreted) * 1e-12, 1e-300),
+                )
+
     def test_compiled_scalar_autodiff_supports_linear_unit_conversion(self) -> None:
         source = (
             "fn objective(value: f64) -> f64 {\n"
@@ -4285,6 +4935,8 @@ int main(void) {
             "fn add_i32(left: i32, right: i32) -> i32 { return left + right; }\n"
             "fn add_u8(left: u8, right: u8) -> u8 { return left + right; }\n"
             "fn mul_i64(left: i64, right: i64) -> i64 { return left * right; }\n"
+            "fn shift_left(value: i32, count: i32) -> i32 { return value << count; }\n"
+            "fn shift_right(value: i32, count: i32) -> i32 { return value >> count; }\n"
             "fn div_i32(left: i32, right: i32) -> i32 { return left / right; }\n"
             "fn rem_i32(left: i32, right: i32) -> i32 { return left % right; }\n"
             "fn neg_i64(value: i64) -> i64 { return -value; }\n"
@@ -4300,6 +4952,10 @@ int main(int argc, char **argv) {
         (void)aether_fn_6164645f7538((uint8_t)255, (uint8_t)1);
     else if (strcmp(argv[1], "signed_multiply") == 0)
         (void)aether_fn_6d756c5f693634(INT64_MAX, 2);
+    else if (strcmp(argv[1], "negative_shift") == 0)
+        (void)aether_fn_73686966745f6c656674(1, -1);
+    else if (strcmp(argv[1], "oversized_shift") == 0)
+        (void)aether_fn_73686966745f7269676874(1, 32);
     else if (strcmp(argv[1], "signed_divide_zero") == 0)
         (void)aether_fn_6469765f693332(1, 0);
     else if (strcmp(argv[1], "signed_divide_min") == 0)
@@ -4322,6 +4978,8 @@ int main(int argc, char **argv) {
             "signed_add",
             "unsigned_add",
             "signed_multiply",
+            "negative_shift",
+            "oversized_shift",
             "signed_divide_zero",
             "signed_divide_min",
             "signed_remainder_zero",
@@ -4332,6 +4990,68 @@ int main(int argc, char **argv) {
             with self.subTest(operation=case):
                 result = self.run_program(executable, case)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
+        with self.assertRaisesRegex(AetherRuntimeError, "returned a value"):
+            run_source(
+                "fn add(left: i32, right: i32) -> i32 { return left + right; }\n",
+                "add",
+                (1 << 31) - 1,
+                1,
+            )
+
+    def test_c99_shifts_match_interpreter_and_power_rejection_is_stable(self) -> None:
+        shift_source = (
+            "fn shift_left(value: i32, count: i32) -> i32 "
+            "{ return value << count; }\n"
+            "fn shift_right(value: i32, count: i32) -> i32 "
+            "{ return value >> count; }\n"
+        )
+        result = self.compile_and_run(
+            emit_c99(shift_source),
+            "int main(void) {\n"
+            "  if (aether_fn_73686966745f6c656674(3, 4) != 48) return 1;\n"
+            "  if (aether_fn_73686966745f7269676874(-16, 2) != -4) return 2;\n"
+            "  if (aether_fn_73686966745f6c656674(1, 31) != INT32_MIN) return 3;\n"
+            "  return 0;\n"
+            "}\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(run_source(shift_source, "shift_left", 3, 4), 48)
+        self.assertEqual(run_source(shift_source, "shift_right", -16, 2), -4)
+        self.assertEqual(run_source(shift_source, "shift_left", 1, 31), -(1 << 31))
+
+        power_source = (
+            "fn power(value: i32, exponent: i32) -> i32 "
+            "{ return value ** exponent; }\n"
+        )
+        self.assertEqual(run_source(power_source, "power", 2, 5), 32)
+        with self.assertRaises(CompilationError) as raised:
+            emit_c99(power_source)
+        self.assertIn(
+            "E_C99_OPERATOR",
+            {item.code for item in raised.exception.diagnostics},
+        )
+
+    def test_compiles_structs_with_independent_copies(self) -> None:
+        source = (
+            "type Point { x: i32, y: i32, }\n"
+            "type Box { point: Point, }\n"
+            "fn check() -> i32 {\n"
+            "  let original = Point { x: 1, y: 2 };\n"
+            "  let wrapper = Box { point: original };\n"
+            "  var copy = original;\n"
+            "  copy.x = 9;\n"
+            "  return wrapper.point.x * 10 + copy.x;\n"
+            "}\n"
+        )
+        generated = emit_c99(source)
+        executable = self.compile_program(
+            generated,
+            "int main(void) {\n"
+            "  return aether_fn_636865636b() == 19 ? 0 : 1;\n"
+            "}\n",
+        )
+        result = self.run_program(executable)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_features_outside_backend_subset_with_diagnostics(self) -> None:
         cases = (
@@ -4341,11 +5061,7 @@ int main(int argc, char **argv) {
                 "E_C99_OPERATOR",
             ),
             (
-                "fn text() -> str { return \"hello\"; }\n",
-                "E_C99_TYPE",
-            ),
-            (
-                "fn tensor(value: Tensor<i32, [2]>) -> Tensor<i32, [2]> "
+                "fn tensor(value: Tensor<i64, [2]>) -> Tensor<i64, [2]> "
                 "{ return value; }\n",
                 "E_C99_TYPE",
             ),
@@ -4355,25 +5071,17 @@ int main(int argc, char **argv) {
                 "E_FFI_TYPE",
             ),
             (
-                "fn result(value: Result<str, IoError>) -> i32 { return 1; }\n",
-                "E_C99_TYPE",
-            ),
-            (
-                "@io fn read() -> Result<str, IoError> { return io_read_line(); }\n",
-                "E_C99_EFFECT",
-            ),
-            (
                 '@ffi\n@link("sensor")\nextern "C" fn café() -> i32;\n',
                 "E_C99_FFI_SYMBOL",
             ),
             (
                 "fn missing_return(value: i32) -> i32 { let copy = value; }\n",
-                "E_C99_RETURN",
+                "E_RETURN_PATH",
             ),
             (
-                "type Pair { left: i32, right: i32 }\n"
+                "type Pair { left: str, right: i32 }\n"
                 "fn value() -> i32 { return 1; }\n",
-                "E_C99_TYPE_DECL",
+                "E_C99_STRUCT_FIELD",
             ),
         )
         for source, expected_code in cases:

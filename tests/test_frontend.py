@@ -6,10 +6,14 @@ from src.ai_view import generate_ai_view
 from src.codemap import build_codemap, render_map
 from src.frontend import (
     AssignmentStmt,
+    ForStmt,
     FunctionDecl,
+    IfStmt,
     LetStmt,
+    LoopControlStmt,
     ReturnStmt,
     TypeDecl,
+    WhileStmt,
     parse_source,
     render_module,
 )
@@ -79,6 +83,20 @@ class FrontendTests(unittest.TestCase):
         self.assertIn("E_UNKNOWN_TYPE", codes)
         self.assertIn("E_CONFLICTING_EFFECTS", codes)
 
+    def test_target_attribute_accepts_one_mcu_target(self) -> None:
+        self.assertEqual(
+            parse_source("@target(mcu)\nfn main() -> i32 { return 0; }\n").diagnostics,
+            (),
+        )
+        invalid = parse_source(
+            "@target(host)\nfn main() -> i32 { return 0; }\n"
+            "@target(mcu)\nfn helper() {}\n"
+        )
+        self.assertEqual(
+            sum(item.code == "E_TARGET_ATTRIBUTE" for item in invalid.diagnostics),
+            2,
+        )
+
     def test_expression_precedence_and_pipeline_shape(self) -> None:
         result = parse_source(
             "fn f(a: i32, b: i32, c: i32) { return a |> scale(b * c + 1); }\n"
@@ -96,6 +114,74 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(addition.children[0].value, "*")
         self.assertEqual(result.diagnostics, ())
 
+    def test_bitwise_precedence_and_base_integer_literals(self) -> None:
+        source = (
+            "fn value(input: i32) -> i32 {\n"
+            "  return input | 0xFF & 0b1010_0001 ^ 0x1 << 2;\n"
+            "}\n"
+        )
+        result = parse_source(source)
+        expression = result.ast.declarations[0].body[0].value
+
+        self.assertEqual(result.diagnostics, ())
+        self.assertEqual(expression.value, "|")
+        self.assertEqual(expression.children[1].value, "^")
+        self.assertEqual(expression.children[1].children[0].value, "&")
+        self.assertEqual(expression.children[1].children[1].value, "<<")
+        self.assertEqual(
+            parse_source(render_module(result.ast)).diagnostics,
+            (),
+        )
+
+    def test_control_flow_roundtrips_with_nested_blocks(self) -> None:
+        source = (
+            "fn count(limit: i32) -> i32 {\n"
+            "  var total = 0;\n"
+            "  for index in 0..limit {\n"
+            "    if index == 2 { continue; }\n"
+            "    while false { break; }\n"
+            "    total += index;\n"
+            "  }\n"
+            "  return total;\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        function = parsed.ast.declarations[0]
+
+        self.assertEqual(parsed.diagnostics, ())
+        self.assertIsInstance(function.body[1], ForStmt)
+        self.assertIsInstance(function.body[1].body[0], IfStmt)
+        self.assertIsInstance(function.body[1].body[0].body[0], LoopControlStmt)
+        self.assertIsInstance(function.body[1].body[1], WhileStmt)
+        self.assertEqual(parse_source(render_module(parsed.ast)).diagnostics, ())
+
+    def test_control_flow_rejects_bad_conditions_ranges_and_loop_control(self) -> None:
+        parsed = parse_source(
+            "fn invalid() -> i32 {\n"
+            "  break;\n"
+            "  if 1 { return 1; }\n"
+            "  for index in 0..1.5 { return index; }\n"
+            "}\n"
+            "fn escaped_local() -> i32 {\n"
+            "  if true { let local = 1; }\n"
+            "  return local;\n"
+            "}\n"
+        )
+        codes = {diagnostic.code for diagnostic in parsed.diagnostics}
+
+        self.assertIn("E_LOOP_CONTROL_CONTEXT", codes)
+        self.assertIn("E_CONDITION_TYPE", codes)
+        self.assertIn("E_RANGE_TYPE", codes)
+        self.assertIn("E_RETURN_PATH", codes)
+        self.assertIn("E_UNKNOWN_NAME", codes)
+        self.assertEqual(
+            sum(
+                diagnostic.code == "E_LOOP_CONTROL_CONTEXT"
+                for diagnostic in parsed.diagnostics
+            ),
+            1,
+        )
+
     def test_var_rebinding_parses_and_renders_as_assignment(self) -> None:
         source = "fn update() -> i32 { var value = 1; value = value + 1; return value; }\n"
         result = parse_source(source)
@@ -106,6 +192,29 @@ class FrontendTests(unittest.TestCase):
         canonical = render_module(result.ast)
         self.assertIn("value = value + 1;", canonical)
         self.assertEqual(parse_source(canonical).diagnostics, ())
+
+    def test_compound_assignment_parses_and_renders(self) -> None:
+        source = (
+            "fn update() -> i32 {\n"
+            "  var value = 1;\n"
+            "  value += 2;\n"
+            "  value -= 1;\n"
+            "  value *= 3;\n"
+            "  value /= 2;\n"
+            "  return value;\n"
+            "}\n"
+        )
+        result = parse_source(source)
+        function = result.ast.declarations[0]
+
+        self.assertEqual(result.diagnostics, ())
+        assignments = function.body[1:5]
+        self.assertTrue(all(isinstance(item, AssignmentStmt) for item in assignments))
+        self.assertEqual(
+            [item.operator for item in assignments],
+            ["+=", "-=", "*=", "/="],
+        )
+        self.assertIn("value += 2;", render_module(result.ast))
 
     def test_ast_rendering_is_parseable_and_view_generation_is_deterministic(self) -> None:
         first = parse_source(self.source)
@@ -207,6 +316,38 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(first.body, ())
         canonical = render_module(parsed.ast)
         reparsed = parse_source(canonical)
+        self.assertEqual(reparsed.diagnostics, ())
+        self.assertEqual(render_module(reparsed.ast), canonical)
+
+    def test_struct_initializer_and_field_assignment_roundtrip(self) -> None:
+        source = (
+            "type Point { x: i32, y: i32, }\n"
+            "fn update(point: Point) -> Point {\n"
+            "  var copy = point;\n"
+            "  copy.x = 2;\n"
+            "  return Point { y: copy.y, x: copy.x };\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        canonical = render_module(parsed.ast)
+        reparsed = parse_source(canonical)
+
+        self.assertEqual(parsed.diagnostics, ())
+        self.assertEqual(reparsed.diagnostics, ())
+        self.assertEqual(render_module(reparsed.ast), canonical)
+
+    def test_collection_literal_and_types_roundtrip(self) -> None:
+        source = (
+            "fn values() -> Array<i32, [2]> {\n"
+            "  let result: Array<i32, [2]> = [4, 5];\n"
+            "  return result;\n"
+            "}\n"
+        )
+        parsed = parse_source(source)
+        canonical = render_module(parsed.ast)
+        reparsed = parse_source(canonical)
+
+        self.assertEqual(parsed.diagnostics, ())
         self.assertEqual(reparsed.diagnostics, ())
         self.assertEqual(render_module(reparsed.ast), canonical)
 

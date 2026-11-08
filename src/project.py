@@ -12,14 +12,19 @@ from src.frontend import (
     Diagnostic,
     Expr,
     ExprStmt,
+    ForStmt,
     FunctionDecl,
+    IfStmt,
     ImportDecl,
     LetStmt,
+    LoopControlStmt,
     Module,
     ReturnStmt,
+    Statement,
     SourceSpan,
     TypeDecl,
     TypeExpr,
+    WhileStmt,
     _BUILTIN_TYPES,
     parse_source,
     validate_module,
@@ -281,6 +286,34 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
             return callee
 
         def rewrite_expression(expression: Expr) -> Expr:
+            if expression.kind == "struct_literal":
+                type_name = expression.value
+                if "::" in type_name:
+                    alias, _, symbol = type_name.partition("::")
+                    target = imported_modules.get(alias)
+                    if target is None:
+                        add_error(
+                            "E_UNKNOWN_IMPORT_ALIAS",
+                            f"Unknown import alias {alias!r}",
+                            expression.span,
+                        )
+                    elif symbol not in type_declarations.get(target, {}):
+                        add_error(
+                            "E_IMPORT_UNKNOWN_TYPE",
+                            f"Module alias {alias!r} has no type {symbol!r}",
+                            expression.span,
+                        )
+                    else:
+                        type_name = internal_name(target, symbol, is_type=True)
+                else:
+                    type_name = local_types.get(type_name, type_name)
+                return replace(
+                    expression,
+                    value=type_name,
+                    children=tuple(
+                        rewrite_expression(child) for child in expression.children
+                    ),
+                )
             if expression.kind == "call":
                 callee = resolve_callee(expression.children[0])
                 raw_arguments = expression.children[1:]
@@ -327,6 +360,73 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
                 ),
             )
 
+        def rewrite_statements(statements: tuple[Statement, ...]) -> tuple[Statement, ...]:
+            rewritten: list[Statement] = []
+            for statement in statements:
+                if isinstance(statement, IfStmt):
+                    rewritten.append(
+                        replace(
+                            statement,
+                            condition=rewrite_expression(statement.condition),
+                            body=rewrite_statements(statement.body),
+                            else_body=rewrite_statements(statement.else_body),
+                        )
+                    )
+                elif isinstance(statement, WhileStmt):
+                    rewritten.append(
+                        replace(
+                            statement,
+                            condition=rewrite_expression(statement.condition),
+                            body=rewrite_statements(statement.body),
+                        )
+                    )
+                elif isinstance(statement, ForStmt):
+                    rewritten.append(
+                        replace(
+                            statement,
+                            start=rewrite_expression(statement.start),
+                            end=rewrite_expression(statement.end),
+                            body=rewrite_statements(statement.body),
+                        )
+                    )
+                elif isinstance(statement, LetStmt):
+                    rewritten.append(
+                        replace(
+                            statement,
+                            annotation=(
+                                resolve_imported_type(statement.annotation)
+                                if statement.annotation is not None
+                                else None
+                            ),
+                            value=rewrite_expression(statement.value),
+                        )
+                    )
+                elif isinstance(statement, AssignmentStmt):
+                    rewritten.append(
+                        replace(statement, value=rewrite_expression(statement.value))
+                    )
+                elif isinstance(statement, ReturnStmt):
+                    rewritten.append(
+                        replace(
+                            statement,
+                            value=(
+                                rewrite_expression(statement.value)
+                                if statement.value is not None
+                                else None
+                            ),
+                        )
+                    )
+                elif isinstance(statement, ExprStmt):
+                    rewritten.append(
+                        replace(
+                            statement,
+                            expression=rewrite_expression(statement.expression),
+                        )
+                    )
+                elif isinstance(statement, LoopControlStmt):
+                    rewritten.append(statement)
+            return tuple(rewritten)
+
         for declaration in module.declarations:
             if isinstance(declaration, TypeDecl):
                 rewritten_declarations.append(
@@ -342,51 +442,7 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
                 continue
             if not isinstance(declaration, FunctionDecl):
                 continue
-            if declaration.external_abi is not None and path != root:
-                add_error(
-                    "E_PROJECT_FFI_UNSUPPORTED",
-                    "Imported extern declarations are not yet supported by project execution",
-                    declaration.span,
-                )
-            rewritten_body = []
-            for statement in declaration.body:
-                if isinstance(statement, LetStmt):
-                    rewritten_body.append(
-                        replace(
-                            statement,
-                            annotation=(
-                                resolve_imported_type(statement.annotation)
-                                if statement.annotation is not None
-                                else None
-                            ),
-                            value=rewrite_expression(statement.value),
-                        )
-                    )
-                elif isinstance(statement, AssignmentStmt):
-                    rewritten_body.append(
-                        replace(
-                            statement,
-                            value=rewrite_expression(statement.value),
-                        )
-                    )
-                elif isinstance(statement, ReturnStmt):
-                    rewritten_body.append(
-                        replace(
-                            statement,
-                            value=(
-                                rewrite_expression(statement.value)
-                                if statement.value is not None
-                                else None
-                            ),
-                        )
-                    )
-                elif isinstance(statement, ExprStmt):
-                    rewritten_body.append(
-                        replace(
-                            statement,
-                            expression=rewrite_expression(statement.expression),
-                        )
-                    )
+            rewritten_body = rewrite_statements(declaration.body)
             rewritten_declarations.append(
                 replace(
                     declaration,
@@ -403,7 +459,7 @@ def compile_project_ir(entry_path: str | os.PathLike[str]) -> IRModule:
                         if declaration.return_type is not None
                         else None
                     ),
-                    body=tuple(rewritten_body),
+                    body=rewritten_body,
                 )
             )
 

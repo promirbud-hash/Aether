@@ -11,14 +11,19 @@ from src.frontend import (
     Diagnostic,
     Expr,
     ExprStmt,
+    ForStmt,
     FunctionDecl,
+    IfStmt,
     LetStmt,
+    LoopControlStmt,
     Module,
     ReturnStmt,
+    Statement,
     SourceSpan,
     TypeDecl,
     TypeExpr,
     UnitExpr,
+    WhileStmt,
     _BUILTIN_CALLS,
     _BUILTIN_TYPES,
     parse_unit_expression_text,
@@ -34,8 +39,18 @@ _INTEGER_TYPES = {
     "i8", "i16", "i32", "i64", "i128",
     "u8", "u16", "u32", "u64", "u128", "usize",
 }
+def _is_range_integer(type_: AetherType | None) -> bool:
+    return type_ is not None and type_.name in _INTEGER_TYPES and not (
+        type_.unit
+        or type_.unit_symbol
+        or type_.unit_scale != 1
+        or type_.unit_offset
+        or type_.unit_pi_power
+    )
+
+
 _FLOAT_TYPES = {"f16", "bf16", "f32", "f64", "fp8"}
-_UNSUPPORTED_BUILTIN_TYPES = {"char", "Slice", "Pool", "Id"}
+_UNSUPPORTED_BUILTIN_TYPES = {"char", "Pool", "Id"}
 _FFI_INTEGER_TYPES = {
     "i8", "i16", "i32", "i64",
     "u8", "u16", "u32", "u64",
@@ -237,6 +252,12 @@ _BUILTIN_OPERATIONS = {
         _result_type(AetherType("bool"), "FsError"),
         "fs",
     ),
+    "args_len": BuiltinOperation((), AetherType("i64"), ""),
+    "args_get": BuiltinOperation(
+        (AetherType("i64"),),
+        _result_type(AetherType("str"), "ArgsError"),
+        "",
+    ),
     "net_get": BuiltinOperation(
         (AetherType("str"),),
         _result_type(AetherType("str"), "NetError"),
@@ -411,6 +432,12 @@ def _resolve_type(type_expr: TypeExpr) -> AetherType:
             unit.kind,
             unit.pi_power,
         )
+    if type_expr.name == "Array" and len(type_expr.arguments) == 2:
+        shape_expr = type_expr.arguments[1]
+        dimensions = tuple(
+            int(value) for value in shape_expr.dimensions if value.isdecimal()
+        ) if shape_expr.name == "[]" else ()
+        return AetherType("Array", (arguments[0],), dimensions)
     if type_expr.unit_expression is not None:
         try:
             unit = _unit_expression_definition(type_expr.unit_expression)
@@ -504,9 +531,36 @@ class _Analyzer:
         self.conversions: list[UnitConversion] = []
         self.current_return_type: AetherType | None = None
         self.effect_summaries: dict[str, EffectSummary] = {}
+        self.current_mutable_names: set[str] = set()
 
     def error(self, code: str, message: str, span: SourceSpan) -> None:
         self.diagnostics.append(Diagnostic(code, message, span))
+
+    def _is_plain_collection_element(
+        self,
+        type_: AetherType,
+        visiting: frozenset[str] = frozenset(),
+    ) -> bool:
+        if type_.name in _NUMERIC_TYPES | _INTEGER_TYPES | {"bool"}:
+            return not (
+                type_.unit
+                or type_.unit_scale != 1
+                or type_.unit_offset
+                or type_.unit_symbol
+                or type_.unit_kind
+                or type_.unit_pi_power
+            )
+        declaration = self.types.get(type_.name)
+        if declaration is None or type_.name in visiting:
+            return False
+        next_visiting = visiting | {type_.name}
+        return all(
+            self._is_plain_collection_element(
+                _resolve_type(field.type),
+                next_visiting,
+            )
+            for field in declaration.fields
+        )
 
     def analyze(self) -> SemanticResult:
         summaries = self._analyze_effects()
@@ -522,6 +576,28 @@ class _Analyzer:
                 )
             if function.external_abi is not None:
                 self._validate_extern_function(function)
+            for attribute in function.attributes:
+                if attribute.name == "C" and (
+                    not function.name.isascii()
+                    or not function.name.isidentifier()
+                    or function.name.startswith("_")
+                    or function.name in {
+                        "auto", "break", "case", "char", "const", "continue",
+                        "default", "do", "double", "else", "enum", "extern",
+                        "float", "for", "goto", "if", "inline", "int", "long",
+                        "register", "restrict", "return", "short", "signed",
+                        "sizeof", "static", "struct", "switch", "typedef",
+                        "union", "unsigned", "void", "volatile", "while",
+                        "_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex",
+                        "_Generic", "_Imaginary", "_Noreturn", "_Static_assert",
+                        "_Thread_local",
+                    }
+                ):
+                    self.error(
+                        "E_C_EXPORT_NAME",
+                        f"Function name {function.name!r} is not a portable C identifier",
+                        function.span,
+                    )
         for declaration in self.types.values():
             if declaration.name in _BUILTIN_TYPES and declaration.name != "FrameBuffer":
                 self.error(
@@ -546,6 +622,7 @@ class _Analyzer:
                         "FrameBuffer ownership cannot be stored in user aggregates",
                         field.type.span,
                     )
+        self._validate_struct_cycles()
         for function in self.functions.values():
             self._analyze_function(function)
         return SemanticResult(
@@ -554,6 +631,43 @@ class _Analyzer:
             tuple(self.conversions),
             tuple(self.diagnostics),
         )
+
+    def _validate_struct_cycles(self) -> None:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        reported: set[tuple[str, str]] = set()
+
+        def referenced_types(type_expr: TypeExpr) -> tuple[str, ...]:
+            names = (type_expr.name,) if type_expr.name in self.types else ()
+            return names + tuple(
+                name
+                for argument in type_expr.arguments
+                for name in referenced_types(argument)
+            )
+
+        def visit(name: str) -> None:
+            if name in visited:
+                return
+            visiting.add(name)
+            declaration = self.types[name]
+            for field in declaration.fields:
+                for target in referenced_types(field.type):
+                    if target in visiting:
+                        edge = (name, target)
+                        if edge not in reported:
+                            reported.add(edge)
+                            self.error(
+                                "E_RECURSIVE_TYPE",
+                                "Struct values cannot contain themselves recursively",
+                                field.span,
+                            )
+                    else:
+                        visit(target)
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in self.types:
+            visit(name)
 
     def _validate_extern_function(self, function: FunctionDecl) -> None:
         if function.external_abi != "C":
@@ -603,6 +717,15 @@ class _Analyzer:
 
     @staticmethod
     def _is_ffi_type(type_expr: TypeExpr, *, allow_void: bool) -> bool:
+        if type_expr.name in {"Slice", "SliceMut"}:
+            return (
+                not allow_void
+                and len(type_expr.arguments) == 1
+                and type_expr.arguments[0].name == "u8"
+                and not type_expr.arguments[0].arguments
+                and not type_expr.dimensions
+                and type_expr.unit_expression is None
+            )
         if type_expr.arguments or type_expr.dimensions or type_expr.unit_expression:
             return False
         if type_expr.name == "void":
@@ -648,12 +771,75 @@ class _Analyzer:
                 "IoError",
                 "FsError",
                 "NetError",
+                "ArgsError",
+                "CollectionError",
             }:
                 self.error(
                     "E_RESULT_ERROR_TYPE",
-                    "Result error type must be IoError, FsError, or NetError",
+                    "Result error type must be a supported error category",
                     type_expr.arguments[1].span,
                 )
+            return
+        if type_expr.name == "Array":
+            if len(type_expr.arguments) != 2:
+                self.error(
+                    "E_ARRAY_TYPE",
+                    "Array type requires an element type and a static shape",
+                    type_expr.span,
+                )
+                return
+            element, shape = type_expr.arguments
+            if shape.name != "[]" or len(shape.dimensions) != 1:
+                self.error(
+                    "E_ARRAY_SHAPE",
+                    "Array shape must contain exactly one static dimension",
+                    shape.span,
+                )
+            elif not shape.dimensions[0].isdecimal() or int(shape.dimensions[0]) <= 0:
+                self.error(
+                    "E_ARRAY_DIMENSION",
+                    "Array length must be a positive integer",
+                    shape.span,
+                )
+            if not self._is_plain_collection_element(_resolve_type(element)):
+                self.error(
+                    "E_COLLECTION_ELEMENT",
+                    "Array element type must be a supported plain value type",
+                    element.span,
+                )
+            return
+        if type_expr.name == "List":
+            if len(type_expr.arguments) != 1:
+                self.error(
+                    "E_LIST_TYPE",
+                    "List type requires exactly one element type",
+                    type_expr.span,
+                )
+            elif not self._is_plain_collection_element(
+                _resolve_type(type_expr.arguments[0])
+            ):
+                self.error(
+                    "E_COLLECTION_ELEMENT",
+                    "List element type must be a supported plain value type",
+                    type_expr.arguments[0].span,
+                )
+            return
+        if type_expr.name == "Slice":
+            if len(type_expr.arguments) != 1 or not self._is_plain_collection_element(
+                _resolve_type(type_expr.arguments[0])
+            ):
+                self.error(
+                    "E_SLICE_TYPE",
+                    "Owned Slice requires one supported plain element type",
+                    type_expr.span,
+                )
+            return
+        if type_expr.name == "SliceMut":
+            self.error(
+                "E_UNSUPPORTED_TYPE",
+                "SliceMut is only supported as a borrowed extern C parameter",
+                type_expr.span,
+            )
             return
         if type_expr.name != "Tensor":
             return
@@ -723,18 +909,31 @@ class _Analyzer:
         for name, function in self.functions.items():
             if function.external_abi is not None:
                 required[name].add("ffi")
-            for statement_index, statement in enumerate(function.body):
-                expression = _statement_expression(statement)
-                if expression is not None:
-                    for node in _walk(expression):
-                        if node.kind == "call" and node.children[0].kind == "identifier":
-                            callee = node.children[0].value
-                            if callee in self.functions:
-                                calls[name].append((callee, node.span))
-                            elif callee in _BUILTIN_OPERATIONS:
-                                required[name].add(
-                                    _BUILTIN_OPERATIONS[callee].effect
-                                )
+            def visit_statements(statements: tuple[Statement, ...]) -> None:
+                for statement in statements:
+                    if isinstance(statement, (IfStmt, WhileStmt)):
+                        expressions = (statement.condition,)
+                        visit_statements(statement.body)
+                        if isinstance(statement, IfStmt):
+                            visit_statements(statement.else_body)
+                    elif isinstance(statement, ForStmt):
+                        expressions = (statement.start, statement.end)
+                        visit_statements(statement.body)
+                    else:
+                        expression = _statement_expression(statement)
+                        expressions = (expression,) if expression is not None else ()
+                    for expression in expressions:
+                        for node in _walk(expression):
+                            if node.kind == "call" and node.children[0].kind == "identifier":
+                                callee = node.children[0].value
+                                if callee in self.functions:
+                                    calls[name].append((callee, node.span))
+                                elif callee in _BUILTIN_OPERATIONS:
+                                    effect = _BUILTIN_OPERATIONS[callee].effect
+                                    if effect:
+                                        required[name].add(effect)
+
+            visit_statements(function.body)
 
         changed = True
         while changed:
@@ -765,6 +964,9 @@ class _Analyzer:
         )
 
     def _analyze_function(self, function: FunctionDecl) -> None:
+        if function.external_abi is not None:
+            return
+
         def contains_frame_buffer(type_: AetherType | None) -> bool:
             return type_ is not None and (
                 type_.name == "FrameBuffer"
@@ -788,8 +990,261 @@ class _Analyzer:
         result_bindings: dict[str, SourceSpan] = {}
         handled_results: set[str] = set()
         mutable_bindings: set[str] = set()
+
+        def field_type_for_assignment(
+            target: AetherType,
+            field_name: str,
+            span: SourceSpan,
+        ) -> AetherType | None:
+            declaration = self.types.get(target.name)
+            if declaration is None:
+                self.error(
+                    "E_ASSIGN_FIELD_TARGET",
+                    f"Cannot assign a field on non-struct value of type {target.display()}",
+                    span,
+                )
+                return None
+            field = next(
+                (item for item in declaration.fields if item.name == field_name),
+                None,
+            )
+            if field is None:
+                self.error(
+                    "E_UNKNOWN_FIELD",
+                    f"Type {target.name!r} has no field {field_name!r}",
+                    span,
+                )
+                return None
+            return _resolve_type(field.type)
+
+        def block_returns(statements: tuple[Statement, ...]) -> bool:
+            for statement in statements:
+                if isinstance(statement, ReturnStmt):
+                    return True
+                if isinstance(statement, IfStmt) and statement.else_body:
+                    if block_returns(statement.body) and block_returns(statement.else_body):
+                        return True
+            return False
+
+        def analyze_nested(
+            statements: tuple[Statement, ...],
+            parent_environment: dict[str, AetherType],
+            parent_mutable: set[str],
+            loop_depth: int,
+        ) -> bool:
+            environment = dict(parent_environment)
+            mutable = set(parent_mutable)
+            for nested in statements:
+                self.current_mutable_names = mutable
+                if isinstance(nested, IfStmt):
+                    condition = self._infer(nested.condition, environment)
+                    if condition is not None and condition.name != "bool":
+                        self.error(
+                            "E_CONDITION_TYPE",
+                            "if condition must have type bool",
+                            nested.condition.span,
+                        )
+                    then_returns = analyze_nested(
+                        nested.body,
+                        environment,
+                        mutable,
+                        loop_depth,
+                    )
+                    else_returns = analyze_nested(
+                        nested.else_body,
+                        environment,
+                        mutable,
+                        loop_depth,
+                    )
+                    if then_returns and else_returns:
+                        return True
+                elif isinstance(nested, WhileStmt):
+                    condition = self._infer(nested.condition, environment)
+                    if condition is not None and condition.name != "bool":
+                        self.error(
+                            "E_CONDITION_TYPE",
+                            "while condition must have type bool",
+                            nested.condition.span,
+                        )
+                    analyze_nested(nested.body, environment, mutable, loop_depth + 1)
+                elif isinstance(nested, ForStmt):
+                    start_type = self._infer(nested.start, environment)
+                    end_type = self._infer(nested.end, environment)
+                    if start_type is not None and not _is_range_integer(start_type):
+                        self.error(
+                            "E_RANGE_TYPE",
+                            "for range bounds must have an integer type",
+                            nested.start.span,
+                        )
+                    if end_type is not None and not _is_range_integer(end_type):
+                        self.error(
+                            "E_RANGE_TYPE",
+                            "for range bounds must have an integer type",
+                            nested.end.span,
+                        )
+                    if (
+                        start_type is not None
+                        and end_type is not None
+                        and start_type.name != end_type.name
+                    ):
+                        self.error(
+                            "E_RANGE_TYPE",
+                            "for range bounds must have the same integer type",
+                            nested.span,
+                        )
+                    loop_environment = dict(environment)
+                    if start_type is not None:
+                        loop_environment[nested.name] = start_type
+                    analyze_nested(
+                        nested.body,
+                        loop_environment,
+                        mutable,
+                        loop_depth + 1,
+                    )
+                elif isinstance(nested, LoopControlStmt):
+                    if loop_depth == 0:
+                        self.error(
+                            "E_LOOP_CONTROL_CONTEXT",
+                            f"'{nested.kind}' is only valid inside a loop",
+                            nested.span,
+                        )
+                elif isinstance(nested, LetStmt):
+                    annotation = (
+                        _resolve_type(nested.annotation)
+                        if nested.annotation is not None
+                        else None
+                    )
+                    inferred = self._infer(
+                        nested.value,
+                        environment,
+                        expected_type=annotation,
+                    )
+                    if annotation is not None:
+                        self._validate_type(nested.annotation)
+                    if (
+                        annotation is not None
+                        and inferred is not None
+                        and not _compatible(annotation, inferred)
+                    ):
+                        self.error(
+                            "E_TYPE_MISMATCH",
+                            f"Binding {nested.name!r} declares {annotation.display()} "
+                            f"but receives {inferred.display()}",
+                            nested.span,
+                        )
+                    if contains_frame_buffer(inferred) or contains_frame_buffer(annotation):
+                        self.error(
+                            "E_CONTROL_RESOURCE_UNSUPPORTED",
+                            "FrameBuffer locals inside control-flow blocks are not yet supported",
+                            nested.span,
+                        )
+                    environment[nested.name] = (
+                        annotation or inferred or AetherType("Unknown")
+                    )
+                    if nested.binding_kind == "var":
+                        mutable.add(nested.name)
+                    if inferred is not None and inferred.name == "Result":
+                        self.error(
+                            "E_CONTROL_RESULT_UNSUPPORTED",
+                            "Result bindings inside control-flow blocks are not yet supported",
+                            nested.span,
+                        )
+                elif isinstance(nested, AssignmentStmt):
+                    target = environment.get(nested.name)
+                    inferred = self._infer(nested.value, environment)
+                    if contains_frame_buffer(target) or contains_frame_buffer(inferred):
+                        self.error(
+                            "E_CONTROL_RESOURCE_UNSUPPORTED",
+                            "FrameBuffer rebinding inside control-flow blocks is not yet supported",
+                            nested.span,
+                        )
+                    if target is None:
+                        self.error(
+                            "E_UNKNOWN_NAME",
+                            f"Unknown assignment target {nested.name!r}",
+                            nested.span,
+                        )
+                    elif nested.name not in mutable:
+                        self.error(
+                            "E_ASSIGN_IMMUTABLE",
+                            f"Cannot rebind immutable value {nested.name!r}; declare it with 'var'",
+                            nested.span,
+                        )
+                    elif nested.field_name is not None:
+                        assigned_field_type = field_type_for_assignment(
+                            target,
+                            nested.field_name,
+                            nested.span,
+                        )
+                        if (
+                            inferred is not None
+                            and assigned_field_type is not None
+                            and not _compatible(assigned_field_type, inferred)
+                        ):
+                            self.error(
+                                _mismatch_code(assigned_field_type, inferred),
+                                f"Cannot assign {inferred.display()} to field "
+                                f"{nested.name}.{nested.field_name} of type "
+                                f"{assigned_field_type.display()}",
+                                nested.span,
+                            )
+                    elif inferred is not None and not _compatible(target, inferred):
+                        self.error(
+                            _mismatch_code(target, inferred),
+                            f"Cannot rebind {nested.name!r} of type {target.display()} "
+                            f"with {inferred.display()}",
+                            nested.span,
+                        )
+                    if nested.operator != "=" and target is not None and not target.is_numeric:
+                        self.error(
+                            "E_COMPOUND_ASSIGN_TYPE",
+                            "Compound assignment currently requires a numeric scalar",
+                            nested.span,
+                        )
+                elif isinstance(nested, ReturnStmt):
+                    actual = (
+                        self._infer(
+                            nested.value,
+                            environment,
+                            expected_type=expected_return,
+                        )
+                        if nested.value is not None
+                        else AetherType("void")
+                    )
+                    if (
+                        expected_return is not None
+                        and actual is not None
+                        and not _compatible(expected_return, actual)
+                    ):
+                        self.error(
+                            "E_RETURN_TYPE",
+                            f"Function {function.name!r} returns {actual.display()}, "
+                            f"expected {expected_return.display()}",
+                            nested.span,
+                        )
+                    return True
+                elif isinstance(nested, ExprStmt):
+                    actual = self._infer(nested.expression, environment)
+                    if contains_frame_buffer(actual):
+                        self.error(
+                            "E_CONTROL_RESOURCE_UNSUPPORTED",
+                            "FrameBuffer expression statements inside control-flow blocks are not yet supported",
+                            nested.span,
+                        )
+                    if actual is not None and actual.name == "Result":
+                        self.error(
+                            "E_UNHANDLED_RESULT",
+                            "Result value must be handled, propagated, or returned",
+                            nested.span,
+                        )
+            return False
+
         reachable = True
         for statement in function.body:
+            self.current_mutable_names = mutable_bindings
+            if isinstance(statement, (IfStmt, WhileStmt, ForStmt, LoopControlStmt)):
+                analyze_nested((statement,), environment, mutable_bindings, 0)
+                continue
             was_reachable = reachable
             statement_expression = _statement_expression(statement)
             if was_reachable and statement_expression is not None:
@@ -805,13 +1260,17 @@ class _Analyzer:
                         statement.span,
                     )
             if isinstance(statement, LetStmt):
-                inferred = self._infer(statement.value, environment)
                 if statement.annotation is not None:
                     self._validate_type(statement.annotation)
                 annotation = (
                     _resolve_type(statement.annotation)
                     if statement.annotation is not None
                     else None
+                )
+                inferred = self._infer(
+                    statement.value,
+                    environment,
+                    expected_type=annotation,
                 )
                 if (
                     contains_frame_buffer(inferred)
@@ -846,7 +1305,22 @@ class _Analyzer:
                             result_bindings[statement.name] = statement.span
             elif isinstance(statement, AssignmentStmt):
                 target_type = environment.get(statement.name)
-                inferred = self._infer(statement.value, environment)
+                assignment_value = statement.value
+                if statement.operator != "=" and target_type is not None:
+                    assignment_value = Expr(
+                        "binary",
+                        statement.span,
+                        statement.operator[:-1],
+                        (
+                            Expr(
+                                "identifier",
+                                statement.span,
+                                statement.name,
+                            ),
+                            statement.value,
+                        ),
+                    )
+                inferred = self._infer(assignment_value, environment)
                 self._validate_frame_buffer_usage(statement.value, environment)
                 if target_type is None:
                     self.error(
@@ -861,11 +1335,45 @@ class _Analyzer:
                         "declare it with 'var'",
                         statement.span,
                     )
+                elif statement.field_name is not None:
+                    assigned_field_type = field_type_for_assignment(
+                        target_type,
+                        statement.field_name,
+                        statement.span,
+                    )
+                    if (
+                        inferred is not None
+                        and assigned_field_type is not None
+                        and not _compatible(assigned_field_type, inferred)
+                    ):
+                        self.error(
+                            _mismatch_code(assigned_field_type, inferred),
+                            f"Cannot assign {inferred.display()} to field "
+                            f"{statement.name}.{statement.field_name} of type "
+                            f"{assigned_field_type.display()}",
+                            statement.span,
+                        )
                 elif inferred is not None and not _compatible(target_type, inferred):
                     self.error(
                         _mismatch_code(target_type, inferred),
                         f"Cannot rebind {statement.name!r} of type "
                         f"{target_type.display()} with {inferred.display()}",
+                        statement.span,
+                    )
+                if (
+                    statement.operator != "="
+                    and target_type is not None
+                    and not target_type.is_numeric
+                ):
+                    self.error(
+                        "E_COMPOUND_ASSIGN_TYPE",
+                        "Compound assignment currently requires a numeric scalar",
+                        statement.span,
+                    )
+                if statement.field_name is not None and statement.operator != "=":
+                    self.error(
+                        "E_STRUCT_FIELD_ASSIGNMENT",
+                        "Compound assignment to struct fields is not supported",
                         statement.span,
                     )
                 if target_type is not None and (
@@ -890,7 +1398,11 @@ class _Analyzer:
                     )
             elif isinstance(statement, ReturnStmt):
                 actual = (
-                    self._infer(statement.value, environment)
+                    self._infer(
+                        statement.value,
+                        environment,
+                        expected_type=expected_return,
+                    )
                     if statement.value is not None
                     else AetherType("void")
                 )
@@ -908,7 +1420,8 @@ class _Analyzer:
                     )
                 )
                 if (
-                    expected_return is not None
+                    function.external_abi is None
+                    and expected_return is not None
                     and actual is not None
                     and not _compatible(expected_return, actual)
                     and not propagates_result
@@ -962,6 +1475,17 @@ class _Analyzer:
                 "E_UNHANDLED_RESULT",
                 f"Result binding {name!r} is never handled, propagated, or returned",
                 span,
+            )
+        if (
+            function.external_abi is None
+            and expected_return is not None
+            and expected_return.name not in {"void", "Unknown"}
+            and not block_returns(function.body)
+        ):
+            self.error(
+                "E_RETURN_PATH",
+                f"Function {function.name!r} must return a value on every path",
+                function.span,
             )
         self.current_return_type = None
 
@@ -1077,6 +1601,8 @@ class _Analyzer:
         expression: Expr | None,
         environment: dict[str, AetherType],
         pipeline_input: AetherType | None = None,
+        *,
+        expected_type: AetherType | None = None,
     ) -> AetherType | None:
         if expression is None:
             return None
@@ -1090,13 +1616,90 @@ class _Analyzer:
                 return self._record(expression, AetherType("str"))
             return self._record(
                 expression,
-                AetherType("f32" if any(char in value for char in ".eE") else "i32"),
+                AetherType(
+                    "f32"
+                    if not value.lower().startswith(("0x", "0b"))
+                    and any(char in value for char in ".eE")
+                    else "i32"
+                ),
             )
         if expression.kind == "identifier":
             return self._record(expression, environment.get(expression.value))
         if expression.kind == "group":
-            value = self._infer(expression.children[0], environment)
+            value = self._infer(
+                expression.children[0],
+                environment,
+                expected_type=expected_type,
+            )
             return self._record(expression, value)
+        if expression.kind == "array_literal":
+            element_type = (
+                expected_type.arguments[0]
+                if expected_type is not None
+                and expected_type.name in {"Array", "List", "Slice"}
+                and expected_type.arguments
+                else None
+            )
+            inferred_types = [
+                self._infer(child, environment, expected_type=element_type)
+                for child in expression.children
+            ]
+            if expected_type is not None:
+                if expected_type.name not in {"Array", "List", "Slice"}:
+                    self.error(
+                        "E_COLLECTION_LITERAL_TYPE",
+                        "Collection literal requires an Array, List, or Slice annotation",
+                        expression.span,
+                    )
+                    return None
+                if expected_type.name == "Array":
+                    if len(expected_type.dimensions) != 1 or (
+                        expected_type.dimensions[0] != len(expression.children)
+                    ):
+                        self.error(
+                            "E_ARRAY_LITERAL_LENGTH",
+                            f"Array literal has {len(expression.children)} elements, "
+                            f"expected {expected_type.dimensions[0] if expected_type.dimensions else 0}",
+                            expression.span,
+                        )
+                for child_type in inferred_types:
+                    if (
+                        child_type is not None
+                        and expected_type.arguments
+                        and not _compatible(expected_type.arguments[0], child_type)
+                    ):
+                        self.error(
+                            "E_COLLECTION_ELEMENT_TYPE",
+                            f"Collection element expects "
+                            f"{expected_type.arguments[0].display()}, got "
+                            f"{child_type.display()}",
+                            expression.span,
+                        )
+                return self._record(expression, expected_type)
+            if not inferred_types:
+                self.error(
+                    "E_COLLECTION_LITERAL_INFERENCE",
+                    "Empty collection literal requires an explicit collection type",
+                    expression.span,
+                )
+                return None
+            inferred_element = inferred_types[0]
+            if inferred_element is None:
+                return None
+            for child_type in inferred_types[1:]:
+                if child_type is not None and not _compatible(
+                    inferred_element,
+                    child_type,
+                ):
+                    self.error(
+                        "E_COLLECTION_ELEMENT_TYPE",
+                        "Collection literal elements must have one matching type",
+                        expression.span,
+                    )
+            return self._record(
+                expression,
+                AetherType("Array", (inferred_element,), (len(inferred_types),)),
+            )
         if expression.kind == "try":
             result_type = self._infer(expression.children[0], environment)
             if result_type is None:
@@ -1177,6 +1780,57 @@ class _Analyzer:
                     )
                     return None
             return self._record(expression, result)
+        if expression.kind == "struct_literal":
+            declaration = self.types.get(expression.value)
+            if declaration is None:
+                self.error(
+                    "E_UNKNOWN_TYPE",
+                    f"Unknown struct type {expression.value!r}",
+                    expression.span,
+                )
+                for child in expression.children:
+                    self._infer(child, environment)
+                return self._record(expression, None)
+            declared_fields = {field.name: field for field in declaration.fields}
+            supplied: set[str] = set()
+            for name, value_expression in zip(
+                expression.field_names,
+                expression.children,
+            ):
+                if name in supplied:
+                    self.error(
+                        "E_STRUCT_FIELD_DUPLICATE",
+                        f"Field {name!r} is initialized more than once",
+                        value_expression.span,
+                    )
+                supplied.add(name)
+                field = declared_fields.get(name)
+                value_type = self._infer(value_expression, environment)
+                if field is None:
+                    self.error(
+                        "E_STRUCT_FIELD_UNKNOWN",
+                        f"Type {declaration.name!r} has no field {name!r}",
+                        value_expression.span,
+                    )
+                elif (
+                    value_type is not None
+                    and not _compatible(_resolve_type(field.type), value_type)
+                ):
+                    expected = _resolve_type(field.type)
+                    self.error(
+                        "E_STRUCT_FIELD_TYPE",
+                        f"Field {name!r} expects {expected.display()}, "
+                        f"got {value_type.display()}",
+                        value_expression.span,
+                    )
+            missing = set(declared_fields) - supplied
+            for name in sorted(missing):
+                self.error(
+                    "E_STRUCT_FIELD_MISSING",
+                    f"Missing initializer for field {name!r} of {declaration.name!r}",
+                    expression.span,
+                )
+            return self._record(expression, AetherType(declaration.name))
         if expression.kind == "member":
             base = self._infer(expression.children[0], environment)
             if expression.value == "?.":
@@ -1203,7 +1857,11 @@ class _Analyzer:
             base = self._infer(expression.children[0], environment)
             index_type = self._infer(expression.children[1], environment)
             if index_type is not None and index_type.name not in _INTEGER_TYPES:
-                self.error("E_INDEX_TYPE", "Tensor index must be an integer", expression.children[1].span)
+                self.error(
+                    "E_INDEX_TYPE",
+                    "Collection index must be an integer",
+                    expression.children[1].span,
+                )
             if base is not None and base.name == "Tensor" and base.arguments:
                 dimensions = base.dimensions[1:] if len(base.dimensions) > 1 else ()
                 element = base.arguments[0]
@@ -1232,6 +1890,12 @@ class _Analyzer:
                     )
                 )
                 return self._record(expression, result)
+            if base is not None and base.name in {"Array", "List", "Slice"}:
+                self.error(
+                    "E_COLLECTION_INDEX",
+                    "Use get(collection, index) to receive a checked Result",
+                    expression.span,
+                )
             return self._record(expression, None)
         if expression.kind == "unary":
             operand = self._infer(expression.children[0], environment)
@@ -1251,6 +1915,17 @@ class _Analyzer:
                 return None
             if operand is not None and expression.value == "!" and operand.name != "bool":
                 self.error("E_TYPE_OPERATOR", "Unary ! requires bool", expression.span)
+                return None
+            if (
+                operand is not None
+                and expression.value == "~"
+                and not _is_range_integer(operand)
+            ):
+                self.error(
+                    "E_BITWISE_TYPE",
+                    "Unary ~ requires a unitless integer",
+                    expression.span,
+                )
                 return None
             return self._record(expression, AetherType("bool") if expression.value == "!" else operand)
         if expression.kind == "binary":
@@ -1284,7 +1959,12 @@ class _Analyzer:
         if expression.kind == "call":
             return self._record(
                 expression,
-                self._infer_call(expression, environment, pipeline_input),
+                self._infer_call(
+                    expression,
+                    environment,
+                    pipeline_input,
+                    expected_type=expected_type,
+                ),
             )
         return None
 
@@ -1297,6 +1977,19 @@ class _Analyzer:
         if left is None or right is None:
             return None
         operator = expression.value
+        if operator in {"&", "|", "^", "<<", ">>"}:
+            if (
+                not _is_range_integer(left)
+                or not _is_range_integer(right)
+                or left.name != right.name
+            ):
+                self.error(
+                    "E_BITWISE_TYPE",
+                    f"Operator {operator} requires matching unitless integer operands",
+                    expression.span,
+                )
+                return None
+            return left
         if operator in {"&&", "||"}:
             if left.name != "bool" or right.name != "bool":
                 self.error(
@@ -1473,6 +2166,8 @@ class _Analyzer:
         expression: Expr,
         environment: dict[str, AetherType],
         pipeline_input: AetherType | None = None,
+        *,
+        expected_type: AetherType | None = None,
     ) -> AetherType | None:
         callee = expression.children[0]
         if callee.kind != "identifier":
@@ -1481,6 +2176,48 @@ class _Analyzer:
         name = callee.value
         if name == "gradient":
             return self._infer_gradient(expression, environment, pipeline_input)
+        if name == "List":
+            if pipeline_input is not None or len(expression.children) not in {1, 2}:
+                self.error(
+                    "E_LIST_CONSTRUCTOR",
+                    "List expects no arguments or one collection literal",
+                    expression.span,
+                )
+                return None
+            if len(expression.children) == 1:
+                if expected_type is None or expected_type.name != "List":
+                    self.error(
+                        "E_LIST_INFERENCE",
+                        "Empty List() requires an explicit List<T> annotation",
+                        expression.span,
+                    )
+                    return None
+                return self._record(expression, expected_type)
+            source_type = self._infer(expression.children[1], environment)
+            if source_type is None:
+                return None
+            if source_type.name not in {"Array", "List", "Slice"}:
+                return self._builtin_type_error(
+                    name,
+                    "expects a collection literal or collection value",
+                    expression.children[1].span,
+                )
+            result = AetherType("List", source_type.arguments)
+            if expected_type is not None and not _compatible(expected_type, result):
+                self.error(
+                    "E_LIST_CONSTRUCTOR_TYPE",
+                    f"List constructor produces {result.display()}, expected "
+                    f"{expected_type.display()}",
+                    expression.span,
+                )
+            return self._record(expression, result)
+        if name in {"get", "set", "slice", "append", "pop", "insert", "remove"}:
+            return self._infer_collection_call(
+                name,
+                expression,
+                environment,
+                pipeline_input,
+            )
         if name == "frame_buffer":
             if pipeline_input is not None or len(expression.children) != 2:
                 self.error(
@@ -1537,7 +2274,11 @@ class _Analyzer:
             if name == "Err":
                 marker = expression.children[1]
                 if marker.kind != "identifier" or marker.value not in {
-                    "IoError", "FsError", "NetError"
+                    "IoError",
+                    "FsError",
+                    "NetError",
+                    "ArgsError",
+                    "CollectionError",
                 }:
                     self.error(
                         "E_RESULT_CONSTRUCTOR_TYPE",
@@ -1659,14 +2400,43 @@ class _Analyzer:
                     f"Function {name!r} expects {len(function.parameters)} arguments, got {len(concrete)}",
                     expression.span,
                 )
-            for parameter, argument in zip(function.parameters, concrete):
+            for parameter_index, (parameter, argument) in enumerate(
+                zip(function.parameters, concrete)
+            ):
                 expected = _resolve_type(parameter.type)
-                if not _compatible(expected, argument):
+                ffi_slice = (
+                    function.external_abi is not None
+                    and expected.name in {"Slice", "SliceMut"}
+                )
+                compatible = (
+                    self._ffi_slice_compatible(expected, argument)
+                    if ffi_slice
+                    else _compatible(expected, argument)
+                )
+                if not compatible:
                     self.error(
                         "E_ARGUMENT_TYPE",
                         f"Argument {parameter.name!r} expects {expected.display()}, got {argument.display()}",
                         expression.span,
                     )
+                elif function.external_abi is not None and expected.name == "SliceMut":
+                    argument_expression = (
+                        expression.children[parameter_index + 1]
+                        if pipeline_input is None
+                        and len(expression.children) > parameter_index + 1
+                        else None
+                    )
+                    if (
+                        argument_expression is None
+                        or argument_expression.kind != "identifier"
+                        or argument_expression.value
+                        not in self.current_mutable_names
+                    ):
+                        self.error(
+                            "E_FFI_MUTABILITY",
+                            "SliceMut<u8> requires a mutable local tensor binding",
+                            expression.span,
+                        )
             return _resolve_type(function.return_type) if function.return_type else None
 
         operation = _BUILTIN_OPERATIONS.get(name)
@@ -1742,6 +2512,7 @@ class _Analyzer:
                     expression.span,
                 )
                 return None
+
             if concrete[0].name != "Tensor" and not concrete[0].is_numeric:
                 return self._builtin_type_error(
                     name,
@@ -1752,10 +2523,139 @@ class _Analyzer:
         if name == "len":
             if len(concrete) != 1:
                 return self._builtin_arity_error(name, 1, expression.span)
-            if concrete[0].name != "Tensor":
-                return self._builtin_type_error(name, "expects a tensor", expression.span)
+            if concrete[0].name not in {"Tensor", "Array", "List", "Slice"}:
+                return self._builtin_type_error(
+                    name,
+                    "expects a Tensor, Array, List, or Slice",
+                    expression.span,
+                )
             return AetherType("i64")
         return None
+
+    @staticmethod
+    def _ffi_slice_compatible(expected: AetherType, actual: AetherType) -> bool:
+        return (
+            expected.name in {"Slice", "SliceMut"}
+            and len(expected.arguments) == 1
+            and expected.arguments[0].name == "u8"
+            and actual.name == "Tensor"
+            and actual.element_type is not None
+            and actual.element_type.name == "u8"
+            and len(actual.dimensions) == 1
+            and not (
+                actual.unit
+                or actual.unit_scale != 1
+                or actual.unit_offset
+                or actual.unit_symbol
+                or actual.unit_kind
+                or actual.unit_pi_power
+            )
+        )
+
+    def _infer_collection_call(
+        self,
+        name: str,
+        expression: Expr,
+        environment: dict[str, AetherType],
+        pipeline_input: AetherType | None,
+    ) -> AetherType | None:
+        if pipeline_input is not None:
+            self.error(
+                "E_COLLECTION_PIPELINE",
+                "Collection operations must be called with explicit arguments",
+                expression.span,
+            )
+            return None
+        raw_arguments = list(expression.children[1:])
+        expected_arity = {
+            "get": 2,
+            "set": 3,
+            "slice": 3,
+            "append": 2,
+            "pop": 1,
+            "insert": 3,
+            "remove": 2,
+        }[name]
+        if len(raw_arguments) != expected_arity:
+            return self._builtin_arity_error(
+                name,
+                expected_arity,
+                expression.span,
+            )
+        argument_types = [
+            self._infer(argument, environment)
+            for argument in raw_arguments
+        ]
+        if any(value is None for value in argument_types):
+            return None
+        concrete = [value for value in argument_types if value is not None]
+        collection_type = concrete[0]
+        if collection_type.name not in {"Array", "List", "Slice"} or not collection_type.arguments:
+            return self._builtin_type_error(
+                name,
+                "expects an Array, List, or Slice as its first argument",
+                raw_arguments[0].span,
+            )
+        element_type = collection_type.arguments[0]
+        index_positions = {
+            "get": (1,),
+            "set": (1,),
+            "slice": (1, 2),
+            "insert": (1,),
+            "remove": (1,),
+        }.get(name, ())
+        for position in index_positions:
+            if concrete[position].name not in _INTEGER_TYPES:
+                self.error(
+                    "E_COLLECTION_INDEX_TYPE",
+                    f"{name} index and bounds must be integers",
+                    raw_arguments[position].span,
+                )
+                return None
+        if name in {"set", "append", "pop", "insert", "remove"}:
+            if collection_type.name != "List" and name != "set":
+                return self._builtin_type_error(
+                    name,
+                    "mutates only a List",
+                    raw_arguments[0].span,
+                )
+            target = raw_arguments[0]
+            if target.kind != "identifier" or target.value not in self.current_mutable_names:
+                self.error(
+                    "E_COLLECTION_MUTABILITY",
+                    f"{name} requires a mutable local collection declared with 'var'",
+                    target.span,
+                )
+                return None
+        if name in {"set", "append"}:
+            value_position = 2 if name == "set" else 1
+            if not _compatible(element_type, concrete[value_position]):
+                self.error(
+                    "E_COLLECTION_ELEMENT_TYPE",
+                    f"{name} value expects {element_type.display()}, got "
+                    f"{concrete[value_position].display()}",
+                    raw_arguments[value_position].span,
+                )
+                return None
+        elif name == "insert":
+            if not _compatible(element_type, concrete[2]):
+                self.error(
+                    "E_COLLECTION_ELEMENT_TYPE",
+                    f"insert value expects {element_type.display()}, got "
+                    f"{concrete[2].display()}",
+                    raw_arguments[2].span,
+                )
+                return None
+        if name == "slice":
+            result = AetherType("Slice", (element_type,))
+        elif name in {"get", "pop", "remove"}:
+            result = element_type
+        else:
+            result = AetherType("void")
+        return self._record(
+            expression,
+            _result_type(result, "CollectionError"),
+        )
 
     def _infer_gradient(
         self,

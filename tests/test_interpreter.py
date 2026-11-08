@@ -1,7 +1,9 @@
+from io import BytesIO
 import math
 from pathlib import Path
 import struct
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +20,177 @@ from src.ir import IRLoweringError, lower_module
 
 
 class TypedIRTests(unittest.TestCase):
+    def test_default_console_runtime_and_typed_io_errors(self) -> None:
+        source = (
+            "@io\n"
+            "fn write() -> Result<void, IoError> { return io_write(\"cześć\\n\"); }\n"
+            "@io\n"
+            "fn read() -> Result<str, IoError> { return io_read_line(); }\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        output = BytesIO()
+        interpreter = Interpreter.from_source(
+            parsed.ast,
+            stdin=BytesIO("żółć\r\n".encode("utf-8")),
+            stdout=output,
+        )
+
+        self.assertEqual(interpreter.run("write"), ResultValue.ok(None))
+        self.assertEqual(output.getvalue(), "cześć\n".encode("utf-8"))
+        self.assertEqual(
+            interpreter.run("read"),
+            ResultValue.ok("żółć"),
+        )
+        self.assertEqual(
+            Interpreter.from_source(parsed.ast, stdin=BytesIO()).run("read"),
+            ResultValue.err(1),
+        )
+        self.assertEqual(
+            Interpreter.from_source(
+                parsed.ast,
+                stdin=BytesIO(b"\xff\n"),
+            ).run("read"),
+            ResultValue.err(2),
+        )
+
+    def test_project_filesystem_runtime_and_stable_error_codes(self) -> None:
+        source = (
+            "@fs\n"
+            "fn read(path: str) -> Result<str, FsError> { return fs_read_text(path); }\n"
+            "@fs\n"
+            "fn write(path: str, text: str) -> Result<void, FsError> {\n"
+            "  return fs_write_text(path, text);\n"
+            "}\n"
+            "@fs\n"
+            "fn exists(path: str) -> Result<bool, FsError> { return fs_exists(path); }\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "existing.txt").write_bytes("héllo".encode("utf-8"))
+            (root / "bad.txt").write_bytes(b"\xff")
+            interpreter = Interpreter.from_source(parsed.ast, project_root=root)
+
+            self.assertEqual(
+                interpreter.run("read", "existing.txt"),
+                ResultValue.ok("héllo"),
+            )
+            self.assertEqual(
+                interpreter.run("write", "created.txt", "новый текст"),
+                ResultValue.ok(None),
+            )
+            self.assertEqual(
+                (root / "created.txt").read_bytes(),
+                "новый текст".encode("utf-8"),
+            )
+            self.assertEqual(
+                interpreter.run("read", "missing.txt"),
+                ResultValue.err(1),
+            )
+            self.assertEqual(
+                interpreter.run("read", "bad.txt"),
+                ResultValue.err(3),
+            )
+            self.assertEqual(
+                interpreter.run("read", "..\\outside.txt"),
+                ResultValue.err(2),
+            )
+            self.assertEqual(
+                interpreter.run("exists", "missing.txt"),
+                ResultValue.ok(False),
+            )
+            self.assertEqual(
+                interpreter.run("exists", "../outside.txt"),
+                ResultValue.err(2),
+            )
+            self.assertEqual(
+                interpreter.run("write", "missing/child.txt", "x"),
+                ResultValue.err(1),
+            )
+
+    def test_process_arguments_exclude_program_name_and_check_bounds(self) -> None:
+        source = (
+            "fn count() -> i64 { return args_len(); }\n"
+            "fn get_argument(index: i64) -> Result<str, ArgsError> { return args_get(index); }\n"
+        )
+        parsed = parse_source(source)
+        self.assertEqual(parsed.diagnostics, ())
+        interpreter = Interpreter.from_source(
+            parsed.ast,
+            program_args=("alpha", "βeta"),
+        )
+
+        self.assertEqual(interpreter.run("count"), 2)
+        self.assertEqual(interpreter.run("get_argument", 0), ResultValue.ok("alpha"))
+        self.assertEqual(interpreter.run("get_argument", 1), ResultValue.ok("βeta"))
+        self.assertEqual(interpreter.run("get_argument", -1), ResultValue.err(1))
+        self.assertEqual(interpreter.run("get_argument", 2), ResultValue.err(1))
+
+    def test_integer_bitwise_operations_and_base_literals(self) -> None:
+        source = (
+            "fn combine(value: i32, shift: i32) -> i32 {\n"
+            "  return (value & 0x0f) | (value ^ 0b1010_0001) "
+            "| ((value << shift) & 0xff);\n"
+            "}\n"
+            "fn invert(value: i32) -> i32 { return ~value; }\n"
+            "fn signed_shift(value: i32, shift: i32) -> i32 {\n"
+            "  return value >> shift;\n"
+            "}\n"
+        )
+        self.assertEqual(run_source(source, "combine", 13, 2), 189)
+        self.assertEqual(run_source(source, "invert", 15), -16)
+        self.assertEqual(run_source(source, "signed_shift", -16, 2), -4)
+        with self.assertRaisesRegex(AetherRuntimeError, "Invalid shift count"):
+            run_source(source, "signed_shift", 1, 32)
+
+    def test_control_flow_executes_scopes_ranges_and_loop_control(self) -> None:
+        source = (
+            "fn total(limit: i32) -> i32 {\n"
+            "  var result = 0;\n"
+            "  for index in 0..limit {\n"
+            "    if index == 2 { continue; }\n"
+            "    if index == 5 { break; }\n"
+            "    result += index;\n"
+            "  }\n"
+            "  return result;\n"
+            "}\n"
+            "fn select(flag: bool) -> i32 {\n"
+            "  if flag { return 11; } else { return 22; }\n"
+            "}\n"
+            "fn while_total() -> i32 {\n"
+            "  var index = 0;\n"
+            "  var result = 0;\n"
+            "  while index < 6 {\n"
+            "    index += 1;\n"
+            "    if index == 2 { continue; }\n"
+            "    if index == 5 { break; }\n"
+            "    result += index;\n"
+            "  }\n"
+            "  return result;\n"
+            "}\n"
+        )
+
+        self.assertEqual(run_source(source, "total", 10), 8)
+        self.assertEqual(run_source(source, "total", 0), 0)
+        self.assertEqual(run_source(source, "select", True), 11)
+        self.assertEqual(run_source(source, "select", False), 22)
+        self.assertEqual(run_source(source, "while_total"), 8)
+
+    def test_compound_assignment_uses_rebinding_semantics(self) -> None:
+        source = (
+            "fn update(value: i32) -> i32 {\n"
+            "  var current = value;\n"
+            "  current += 2;\n"
+            "  current -= 1;\n"
+            "  current *= 3;\n"
+            "  current /= 2;\n"
+            "  return current;\n"
+            "}\n"
+        )
+        self.assertEqual(run_source(source, "update", 4), 7)
+
     def test_ir_records_frame_resource_construction_order(self) -> None:
         parsed = parse_source(
             "fn inspect(size: u64, other: u64) -> u64 {\n"
@@ -1661,7 +1834,7 @@ class InterpreterTests(unittest.TestCase):
         self.assertAlmostEqual(result[0][0], -1.0)
         self.assertAlmostEqual(result[3][3], 1.0)
 
-    def test_match_handles_injected_result_and_effects_are_opt_in(self) -> None:
+    def test_match_handles_host_and_injected_effect_results(self) -> None:
         parsed = parse_source(
             "@io\n"
             "fn read_or_default() -> str {\n"
@@ -1671,8 +1844,10 @@ class InterpreterTests(unittest.TestCase):
         )
         self.assertEqual(parsed.diagnostics, ())
 
-        with self.assertRaisesRegex(AetherRuntimeError, "no injected handler"):
-            Interpreter.from_source(parsed.ast).run("read_or_default")
+        self.assertEqual(
+            Interpreter.from_source(parsed.ast, stdin=BytesIO()).run("read_or_default"),
+            "fallback",
+        )
         with self.assertRaisesRegex(AetherRuntimeError, "invalid success value"):
             Interpreter.from_source(
                 parsed.ast,
@@ -1810,7 +1985,6 @@ class InterpreterTests(unittest.TestCase):
             "fn tensor_divide(values: Tensor<f32, [2]>, divisor: f32) "
             "-> Tensor<f32, [2]> { return values / divisor; }\n"
             "fn divide(left: f32, right: f32) -> f32 { return left / right; }\n"
-            "fn missing() -> f32 {}\n"
             "fn recurse() -> i32 { return recurse(); }\n"
         )
         interpreter = Interpreter.from_source(parsed.ast)
@@ -1825,8 +1999,11 @@ class InterpreterTests(unittest.TestCase):
             interpreter.run("out_of_bounds", [1.0, 2.0])
         with self.assertRaisesRegex(AetherRuntimeError, "Division by zero"):
             interpreter.run("tensor_divide", [1.0, 2.0], 0.0)
-        with self.assertRaisesRegex(AetherRuntimeError, "completed without returning"):
-            interpreter.run("missing")
+        missing_return = parse_source("fn missing() -> f32 {}\n")
+        self.assertIn(
+            "E_RETURN_PATH",
+            {diagnostic.code for diagnostic in missing_return.diagnostics},
+        )
         with self.assertRaisesRegex(AetherRuntimeError, "Maximum call depth"):
             Interpreter.from_source(parsed.ast, max_call_depth=4).run("recurse")
 
@@ -1853,6 +2030,52 @@ class InterpreterTests(unittest.TestCase):
             interpreter.run("x", {"x": 2.0})
         with self.assertRaisesRegex(TypeError, "point.x expects f32"):
             interpreter.run("x", {"x": "bad", "y": 3.0})
+
+    def test_struct_values_initialize_mutate_and_copy_independently(self) -> None:
+        source = (
+            "type Point { x: i32, y: i32, }\n"
+            "fn check() -> i32 {\n"
+            "  let original = Point { x: 1, y: 2 };\n"
+            "  var copy = original;\n"
+            "  copy.x = 9;\n"
+            "  return original.x * 10 + copy.x;\n"
+            "}\n"
+        )
+        self.assertEqual(run_source(source, "check"), 19)
+
+    def test_collection_operations_check_errors_and_copy_on_write(self) -> None:
+        source = (
+            "fn check() -> bool {\n"
+            "  var values: List<i32> = List([1, 2, 3]);\n"
+            "  let original = values;\n"
+            "  let appended = match append(values, 4) {\n"
+            "    Ok(_) => 0, Err(_) => -10,\n"
+            "  };\n"
+            "  let original_len = len(original);\n"
+            "  let sliced = match slice(values, 1, 3) {\n"
+            "    Ok(_) => true, Err(_) => false,\n"
+            "  };\n"
+            "  let removed = match remove(values, 0) {\n"
+            "    Ok(value) => value, Err(_) => -30,\n"
+            "  };\n"
+            "  let original_last = match get(original, 2) {\n"
+            "    Ok(value) => value == 3, Err(_) => false,\n"
+            "  };\n"
+            "  return original_len == len(values) && sliced && original_last "
+            "&& removed == 1 && appended == 0;\n"
+            "}\n"
+            "fn empty_pop() -> i32 {\n"
+            "  var values: List<i32> = List();\n"
+            "  return match pop(values) { Ok(_) => 0, Err(_) => -2 };\n"
+            "}\n"
+            "fn fixed() -> i32 {\n"
+            "  let values: Array<i32, [2]> = [4, 5];\n"
+            "  return match get(values, 2) { Ok(value) => value, Err(_) => -1 };\n"
+            "}\n"
+        )
+        self.assertTrue(run_source(source, "check"))
+        self.assertEqual(run_source(source, "empty_pop"), -2)
+        self.assertEqual(run_source(source, "fixed"), -1)
 
     def test_public_api_compiles_and_runs_clean_source_with_injected_effects(self) -> None:
         pure_source = "fn double(value: i32) -> i32 { return value * 2; }\n"
@@ -1939,6 +2162,45 @@ class InterpreterTests(unittest.TestCase):
             )
         )
         self.assertEqual(calls, ["reset"])
+
+    def test_slice_ffi_handlers_share_read_only_and_mutable_tensor_buffers(self) -> None:
+        source = (
+            '@ffi @link("native") extern "C" fn inspect_bytes('
+            "bytes: Slice<u8>) -> i32;\n"
+            '@ffi @link("native") extern "C" fn update_bytes('
+            "bytes: SliceMut<u8>) -> void;\n"
+            "@ffi fn submit(bytes: Tensor<u8, [3]>) -> i32 {\n"
+            "  return inspect_bytes(bytes);\n"
+            "}\n"
+            "@ffi fn mutate(bytes: Tensor<u8, [3]>) -> Tensor<u8, [3]> {\n"
+            "  var buffer = bytes;\n"
+            "  update_bytes(buffer);\n"
+            "  return buffer;\n"
+            "}\n"
+        )
+        observed: list[bytes] = []
+        escaped_views: list[object] = []
+
+        def inspect(buffer: object) -> int:
+            observed.append(buffer.to_bytes())  # type: ignore[attr-defined]
+            escaped_views.append(buffer)
+            return 0
+
+        def update(buffer: object) -> None:
+            buffer[1] = 9  # type: ignore[index]
+
+        interpreter = Interpreter.from_source(
+            parse_source(source).ast,
+            external_handlers={
+                "inspect_bytes": inspect,
+                "update_bytes": update,
+            },
+        )
+        self.assertEqual(interpreter.run("submit", [1, 2, 3]), 0)
+        self.assertEqual(observed, [bytes((1, 2, 3))])
+        with self.assertRaisesRegex(AetherRuntimeError, "after extern call"):
+            escaped_views[0][0]  # type: ignore[index]
+        self.assertEqual(interpreter.run("mutate", [1, 2, 3]), [1, 9, 3])
 
     def test_public_api_rejects_parse_and_semantic_errors(self) -> None:
         with self.assertRaises(CompilationError) as syntax_error:

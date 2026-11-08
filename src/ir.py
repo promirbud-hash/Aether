@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
 from src.frontend import (
     AssignmentStmt,
     Expr,
     ExprStmt,
+    ForStmt,
     FunctionDecl,
+    IfStmt,
     LetStmt,
+    LoopControlStmt,
     Module,
     ReturnStmt,
     SourceSpan,
+    Statement,
     TypeDecl,
+    WhileStmt,
 )
 from src.semantic import (
     AetherType,
@@ -44,6 +50,7 @@ class IRExpression:
     conversion: UnitConversion | None = None
     ownership: str = "plain"
     temporary_owner: bool = False
+    field_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,11 @@ class IRStatement:
     binding_kind: str = ""
     expression: IRExpression | None = None
     ownership_actions: tuple[IROwnershipAction, ...] = ()
+    operator: str = "="
+    expressions: tuple[IRExpression, ...] = ()
+    body: tuple[IRStatement, ...] = ()
+    else_body: tuple[IRStatement, ...] = ()
+    field_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,17 @@ class IRFunction:
     external_library: str | None = None
     frame_resources: tuple[str, ...] = ()
     frame_resource_types: tuple[tuple[str, AetherType], ...] = ()
+    c_exported: bool = False
+    external_symbol: str | None = None
+
+
+def walk_statements(
+    statements: tuple[IRStatement, ...],
+) -> Iterator[IRStatement]:
+    for statement in statements:
+        yield statement
+        yield from walk_statements(statement.body)
+        yield from walk_statements(statement.else_body)
 
 
 @dataclass(frozen=True)
@@ -98,6 +121,7 @@ class IRModule:
     types: tuple[IRTypeDeclaration, ...]
     source_paths: tuple[str, ...] = ()
     source_hashes: tuple[tuple[str, str], ...] = ()
+    target: str | None = None
 
     def function(self, name: str) -> IRFunction:
         for function in self.functions:
@@ -180,7 +204,8 @@ def lower_module(module: Module, semantics: SemanticResult | None = None) -> IRM
             else:
                 expression_type = AetherType(
                     "f32"
-                    if any(char in expression.value for char in ".eE")
+                    if not expression.value.lower().startswith(("0x", "0b"))
+                    and any(char in expression.value for char in ".eE")
                     else "i32"
                 )
         arms = tuple(
@@ -234,6 +259,7 @@ def lower_module(module: Module, semantics: SemanticResult | None = None) -> IRM
                     )
                 )
             ),
+            expression.field_names,
         )
 
     def untyped_expressions(
@@ -283,93 +309,135 @@ def lower_module(module: Module, semantics: SemanticResult | None = None) -> IRM
             continue
         if not isinstance(declaration, FunctionDecl):
             continue
-        body: list[IRStatement] = []
-        for statement in declaration.body:
-            if isinstance(statement, LetStmt):
-                expression = lower_expression(statement.value)
-                ownership_actions: tuple[IROwnershipAction, ...] = ()
-                if contains_frame_buffer(expression.type):
-                    if expression.ownership == "borrowed":
-                        ownership_actions = (
-                            IROwnershipAction(
-                                "retain",
-                                statement.name,
-                                statement.value.value
-                                if statement.value.kind == "identifier"
-                                else "",
-                            ),
+        def lower_statements(
+            statements: tuple[Statement, ...],
+        ) -> tuple[IRStatement, ...]:
+            body: list[IRStatement] = []
+            for statement in statements:
+                if isinstance(statement, IfStmt):
+                    body.append(
+                        IRStatement(
+                            "if",
+                            statement.span,
+                            expression=lower_expression(statement.condition),
+                            body=lower_statements(statement.body),
+                            else_body=lower_statements(statement.else_body),
                         )
-                    else:
-                        ownership_actions = (
-                            IROwnershipAction("transfer", statement.name),
-                        )
-                body.append(
-                    IRStatement(
-                        "let",
-                        statement.span,
-                        statement.name,
-                        statement.binding_kind,
-                        expression,
-                        ownership_actions,
                     )
-                )
-            elif isinstance(statement, AssignmentStmt):
-                expression = lower_expression(statement.value)
-                actions: list[IROwnershipAction] = []
-                if contains_frame_buffer(expression.type):
-                    if expression.ownership == "borrowed":
-                        actions.append(
-                            IROwnershipAction(
-                                "retain",
-                                statement.name,
-                                statement.value.value
-                                if statement.value.kind == "identifier"
-                                else "",
+                elif isinstance(statement, WhileStmt):
+                    body.append(
+                        IRStatement(
+                            "while",
+                            statement.span,
+                            expression=lower_expression(statement.condition),
+                            body=lower_statements(statement.body),
+                        )
+                    )
+                elif isinstance(statement, ForStmt):
+                    body.append(
+                        IRStatement(
+                            "for",
+                            statement.span,
+                            name=statement.name,
+                            expressions=(
+                                lower_expression(statement.start),
+                                lower_expression(statement.end),
+                            ),
+                            body=lower_statements(statement.body),
+                        )
+                    )
+                elif isinstance(statement, LoopControlStmt):
+                    body.append(IRStatement(statement.kind, statement.span))
+                elif isinstance(statement, LetStmt):
+                    expression = lower_expression(statement.value)
+                    ownership_actions: tuple[IROwnershipAction, ...] = ()
+                    if contains_frame_buffer(expression.type):
+                        if expression.ownership == "borrowed":
+                            ownership_actions = (
+                                IROwnershipAction(
+                                    "retain",
+                                    statement.name,
+                                    statement.value.value
+                                    if statement.value.kind == "identifier"
+                                    else "",
+                                ),
+                            )
+                        else:
+                            ownership_actions = (
+                                IROwnershipAction("transfer", statement.name),
+                            )
+                    body.append(
+                        IRStatement(
+                            "let",
+                            statement.span,
+                            statement.name,
+                            statement.binding_kind,
+                            expression,
+                            ownership_actions,
+                        )
+                    )
+                elif isinstance(statement, AssignmentStmt):
+                    expression = lower_expression(statement.value)
+                    actions: list[IROwnershipAction] = []
+                    if contains_frame_buffer(expression.type):
+                        if expression.ownership == "borrowed":
+                            actions.append(
+                                IROwnershipAction(
+                                    "retain",
+                                    statement.name,
+                                    statement.value.value
+                                    if statement.value.kind == "identifier"
+                                    else "",
+                                )
+                            )
+                        actions.extend(
+                            (
+                                IROwnershipAction("release", statement.name),
+                                IROwnershipAction("transfer", statement.name),
                             )
                         )
-                    actions.extend(
-                        (
-                            IROwnershipAction("release", statement.name),
-                            IROwnershipAction("transfer", statement.name),
+                    body.append(
+                        IRStatement(
+                            "assignment",
+                            statement.span,
+                            statement.name,
+                            expression=expression,
+                            ownership_actions=tuple(actions),
+                            operator=statement.operator,
+                            field_name=statement.field_name,
                         )
                     )
-                body.append(
-                    IRStatement(
-                        "assignment",
-                        statement.span,
-                        statement.name,
-                        expression=expression,
-                        ownership_actions=tuple(actions),
+                elif isinstance(statement, ReturnStmt):
+                    expression = (
+                        lower_expression(statement.value)
+                        if statement.value is not None
+                        else None
                     )
-                )
-            elif isinstance(statement, ReturnStmt):
-                expression = (
-                    lower_expression(statement.value)
-                    if statement.value is not None
-                    else None
-                )
-                actions: tuple[IROwnershipAction, ...] = ()
-                if expression is not None and contains_frame_buffer(expression.type):
-                    if expression.ownership == "borrowed":
-                        actions = (IROwnershipAction("retain_return"),)
-                    else:
-                        actions = (IROwnershipAction("transfer_return"),)
-                body.append(
-                    IRStatement(
-                        "return",
-                        statement.span,
-                        expression=expression,
-                        ownership_actions=actions,
+                    actions: tuple[IROwnershipAction, ...] = ()
+                    if expression is not None and contains_frame_buffer(expression.type):
+                        if expression.ownership == "borrowed":
+                            actions = (IROwnershipAction("retain_return"),)
+                        else:
+                            actions = (IROwnershipAction("transfer_return"),)
+                    body.append(
+                        IRStatement(
+                            "return",
+                            statement.span,
+                            expression=expression,
+                            ownership_actions=actions,
+                        )
                     )
-                )
-            elif isinstance(statement, ExprStmt):
-                body.append(
-                    IRStatement(
-                        "expression",
-                        statement.span,
-                        expression=lower_expression(statement.expression),
+                elif isinstance(statement, ExprStmt):
+                    body.append(
+                        IRStatement(
+                            "expression",
+                            statement.span,
+                            expression=lower_expression(statement.expression),
+                        )
                     )
-                )
+            return tuple(body)
+
+        body = lower_statements(declaration.body)
         effect_summary = effect_summaries.get(declaration.name)
         functions.append(
             IRFunction(
@@ -389,13 +457,13 @@ def lower_module(module: Module, semantics: SemanticResult | None = None) -> IRM
                 declaration.return_type is not None,
                 effect_summary.declared if effect_summary else (),
                 effect_summary.required if effect_summary else (),
-                tuple(body),
+                body,
                 declaration.span,
                 declaration.external_abi,
                 declaration.external_library,
                 tuple(
                     statement.name
-                    for statement in body
+                    for statement in walk_statements(body)
                     if statement.kind == "let"
                     and statement.expression is not None
                     and contains_frame_buffer(statement.expression.type)
@@ -405,20 +473,34 @@ def lower_module(module: Module, semantics: SemanticResult | None = None) -> IRM
                         statement.name,
                         statement.expression.type,
                     )
-                    for statement in body
+                    for statement in walk_statements(body)
                     if statement.kind == "let"
                     and statement.expression is not None
                     and contains_frame_buffer(statement.expression.type)
                 ),
+                any(attribute.name == "C" for attribute in declaration.attributes),
+                declaration.external_symbol,
             )
         )
-    ir_module = IRModule(tuple(functions), tuple(types))
+    target = next(
+        (
+            attribute.arguments[0]
+            for declaration in module.declarations
+            for attribute in declaration.attributes
+            if attribute.name == "target" and attribute.arguments
+        ),
+        None,
+    )
+    ir_module = IRModule(tuple(functions), tuple(types), target=target)
     errors = tuple(
         diagnostic
         for function in ir_module.functions
-        for statement in function.body
-        if statement.expression is not None
-        for diagnostic in untyped_expressions(statement.expression)
+        for statement in walk_statements(function.body)
+        for expression in (
+            *((statement.expression,) if statement.expression is not None else ()),
+            *statement.expressions,
+        )
+        for diagnostic in untyped_expressions(expression)
     )
     if errors:
         raise IRLoweringError(errors)

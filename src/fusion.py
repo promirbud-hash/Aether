@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import replace
 
-from src.ir import IRExpression, IRFunction, IRModule, IRStatement
+from src.ir import IRExpression, IRFunction, IRModule, IRStatement, walk_statements
 
 
 def fuse_elementwise_tensors(module: IRModule) -> IRModule:
@@ -13,9 +13,12 @@ def fuse_elementwise_tensors(module: IRModule) -> IRModule:
     gradient_targets = {
         expression.value
         for function in module.functions
-        for statement in function.body
-        if statement.expression is not None
-        for expression in _walk(statement.expression)
+        for statement in walk_statements(function.body)
+        for statement_expression in (
+            *((statement.expression,) if statement.expression is not None else ()),
+            *statement.expressions,
+        )
+        for expression in _walk(statement_expression)
         if expression.kind == "gradient"
     }
     functions = tuple(

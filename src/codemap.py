@@ -8,13 +8,17 @@ from pathlib import Path
 from src.frontend import (
     AssignmentStmt,
     Expr,
+    ForStmt,
     FunctionDecl,
+    IfStmt,
     LetStmt,
     Module,
     ReturnStmt,
+    Statement,
     TypeDecl,
     TypeExpr,
     UnitExpr,
+    WhileStmt,
     parse_source,
     parse_source_file,
 )
@@ -408,10 +412,25 @@ def _build_ast_codemap(module: Module) -> CodeMap:
         if declaration.return_type is not None:
             used_types.update(_type_names(declaration.return_type))
             units.update(_type_units(declaration.return_type))
-        for statement in declaration.body:
-            expression = _statement_expression(statement)
-            if expression is None:
-                continue
+        def statement_expressions(
+            statements: tuple[Statement, ...],
+        ):
+            for statement in statements:
+                if isinstance(statement, (IfStmt, WhileStmt)):
+                    yield statement.condition
+                    yield from statement_expressions(statement.body)
+                    if isinstance(statement, IfStmt):
+                        yield from statement_expressions(statement.else_body)
+                elif isinstance(statement, ForStmt):
+                    yield statement.start
+                    yield statement.end
+                    yield from statement_expressions(statement.body)
+                else:
+                    expression = _statement_expression(statement)
+                    if expression is not None:
+                        yield expression
+
+        for expression in statement_expressions(declaration.body):
             for node in _expression_nodes(expression):
                 if node.kind == "call" and node.children[0].kind == "identifier":
                     called = node.children[0].value

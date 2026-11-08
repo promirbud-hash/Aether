@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Protocol
 
 from src.frontend import Module, parse_source_file, render_module
-from src.parser import CSTNode, parse
+from src.parser import CSTNode, parse, tokenize
 
 
 _WORD_KINDS = {"IDENTIFIER", "KEYWORD", "NUMBER", "STRING"}
@@ -205,23 +205,28 @@ def _view(
         view_offset += len(text)
         return start, view_offset
 
+    def lexical_tokens(text: str) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (token.kind, token.value)
+            for token in tokenize(text)
+            if token.kind not in {"WHITESPACE", "NEWLINE", "COMMENT"}
+        )
+
     declarations = sorted(aliases.items(), key=lambda item: item[1])
-    if declarations:
-        header = f"@a({profile.name};"
-        append(header)
-        for index, (source_value, alias) in enumerate(declarations):
-            if index:
-                append(",")
-            start, end = append(f"{alias}={source_value}")
-            origin = next(
-                ((source_start, source_end) for _, value, source_start, source_end in leaves if value == source_value),
-                None,
+    append(f"@a({profile.name};")
+    for index, (source_value, alias) in enumerate(declarations):
+        if index:
+            append(",")
+        start, end = append(f"{alias}={source_value}")
+        origin = next(
+            ((source_start, source_end) for _, value, source_start, source_end in leaves if value == source_value),
+            None,
+        )
+        if origin is not None:
+            mappings.append(
+                ViewMapping(origin[0], origin[1], start, end, "alias_declaration")
             )
-            if origin is not None:
-                mappings.append(
-                    ViewMapping(origin[0], origin[1], start, end, "alias_declaration")
-                )
-        append(")")
+    append(")")
 
     previous_rendered = ""
     previous_is_word = False
@@ -233,10 +238,14 @@ def _view(
             or (value not in aliases and kind in _WORD_KINDS)
         )
         if output:
+            joined_tokens = lexical_tokens(previous_rendered + rendered)
+            separate_tokens = lexical_tokens(previous_rendered) + lexical_tokens(rendered)
             if (
                 previous_is_word
                 and current_is_word
-            ) or previous_rendered + rendered in _MERGING_OPERATORS:
+            ) or previous_rendered + rendered in _MERGING_OPERATORS or (
+                joined_tokens != separate_tokens
+            ):
                 append(" ")
         start, end = append(rendered)
         mappings.append(
@@ -379,3 +388,175 @@ def generate_ai_view_from_file(
         )
         raise ValueError(f"Cannot generate AI view: {joined}")
     return generate_ai_view(result.ast, profile, encoder)
+
+
+def expand_ai_view(
+    text: str,
+    profile: TokenizerProfile | None = None,
+) -> str:
+    """Expand a profile-tagged `.ai` view back to compact Aether source text."""
+    profile = profile or default_profile()
+    if not text.startswith("@a("):
+        raise ValueError("AI view is missing its @a expansion header")
+    header_end = text.find(")", 3)
+    if header_end < 0:
+        raise ValueError("AI view has an unterminated @a expansion header")
+    header = text[3:header_end]
+    profile_name, separator, declarations = header.partition(";")
+    if not separator or profile_name != profile.name:
+        raise ValueError(
+            f"AI view profile header does not match {profile.name!r}"
+        )
+    body = text[header_end + 1 :]
+    if "@a(" in body:
+        raise ValueError("AI view contains an unexpected second @a header")
+
+    alias_to_source: dict[str, str] = {}
+    source_to_alias: dict[str, str] = {}
+    known_aliases = {
+        **profile.operator_aliases,
+        **profile.idiom_aliases,
+        **profile.semantic_aliases,
+    }
+    for declaration in declarations.split(",") if declarations else ():
+        alias, equals, source = declaration.partition("=")
+        if not equals or not alias or not source:
+            raise ValueError("AI view contains a malformed alias declaration")
+        if alias in alias_to_source:
+            raise ValueError(f"AI view contains duplicate alias {alias!r}")
+        if source in source_to_alias:
+            raise ValueError(f"AI view contains duplicate source alias {source!r}")
+        alias_tokens = tuple(
+            token.value
+            for token in tokenize(alias)
+            if token.kind not in {"WHITESPACE", "NEWLINE", "COMMENT"}
+        )
+        source_token_list = tuple(
+            token
+            for token in tokenize(source)
+            if token.kind not in {"WHITESPACE", "NEWLINE", "COMMENT"}
+        )
+        if (
+            not alias_tokens
+            or not source_token_list
+            or "".join(alias_tokens) != alias
+        ):
+            raise ValueError(f"AI view contains an invalid alias {alias!r}")
+        if (
+            len(source_token_list) != 1
+            or source_token_list[0].value != source
+        ):
+            raise ValueError(
+                f"AI view source alias {source!r} must be a single Aether token"
+            )
+        choices = known_aliases.get(source)
+        if choices is not None:
+            if alias not in choices:
+                raise ValueError(
+                    f"AI view alias {alias!r} is not valid for {source!r}"
+                )
+        elif (
+            source_token_list[0].kind != "IDENTIFIER"
+            or alias not in profile.alias_candidates
+        ):
+            raise ValueError(
+                f"AI view alias {alias!r} is not valid for source identifier {source!r}"
+            )
+        alias_to_source[alias] = source
+        source_to_alias[source] = alias
+
+    tokenized_aliases = sorted(
+        (
+            (
+                tuple(
+                    token.value
+                    for token in tokenize(alias)
+                    if token.kind not in {"WHITESPACE", "NEWLINE", "COMMENT"}
+                ),
+                source,
+            )
+            for alias, source in alias_to_source.items()
+        ),
+        key=lambda item: (-len(item[0]), item[0]),
+    )
+    tokens = tokenize(body)
+    expanded_tokens: list[tuple[str, str]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.kind in {"WHITESPACE", "NEWLINE", "COMMENT"}:
+            index += 1
+            continue
+        replacement = None
+        replacement_end = index
+        for alias_tokens, source in tokenized_aliases:
+            matched_indexes: list[int] = []
+            candidate_index = index
+            for alias_token in alias_tokens:
+                if (
+                    candidate_index >= len(tokens)
+                    or tokens[candidate_index].value != alias_token
+                ):
+                    break
+                matched_indexes.append(candidate_index)
+                candidate_index += 1
+            if len(matched_indexes) != len(alias_tokens):
+                continue
+            if any(
+                tokens[left].end != tokens[right].start
+                for left, right in zip(matched_indexes, matched_indexes[1:])
+            ):
+                continue
+            replacement = source
+            replacement_end = matched_indexes[-1]
+            break
+        if replacement is None:
+            expanded_tokens.append((token.value, token.kind))
+            index += 1
+            continue
+        expanded_tokens.extend(
+            (source_token.value, source_token.kind)
+            for source_token in tokenize(replacement)
+            if source_token.kind not in {"WHITESPACE", "NEWLINE", "COMMENT"}
+        )
+        index = replacement_end + 1
+    compact: list[str] = []
+    previous_value = ""
+    previous_is_word = False
+    for value, kind in expanded_tokens:
+        current_is_word = kind in _WORD_KINDS
+        if compact:
+            merged = [
+                token
+                for token in tokenize(previous_value + value)
+                if token.kind not in {"WHITESPACE", "NEWLINE", "COMMENT"}
+            ]
+            if (
+                previous_is_word and current_is_word
+                or len(merged) != 2
+                or merged[0].value != previous_value
+                or merged[1].value != value
+            ):
+                compact.append(" ")
+        compact.append(value)
+        previous_value = value
+        previous_is_word = current_is_word
+    return "".join(compact)
+
+
+def ai_view_to_source(
+    text: str,
+    profile: TokenizerProfile | None = None,
+) -> str:
+    """Expand an edited `.ai` view and render it as canonical `.hl` source."""
+    from src.frontend import parse_source, render_module
+
+    expanded = expand_ai_view(text, profile)
+    result = parse_source(expanded)
+    errors = [item for item in result.diagnostics if item.severity == "error"]
+    if errors:
+        joined = "; ".join(
+            f"{item.code} line {item.span.line}: {item.message}" for item in errors
+        )
+        raise ValueError(f"Edited AI view is not valid Aether source: {joined}")
+    return render_module(result.ast)

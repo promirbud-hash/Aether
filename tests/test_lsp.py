@@ -124,6 +124,146 @@ class LspTests(unittest.TestCase):
         self.assertEqual(source_result["result"]["sourceRange"], mapping["sourceRange"])
         self.assertEqual(view_position["result"]["viewRange"], mapping["viewRange"])
 
+    def test_apply_ai_view_edits_returns_versioned_source_edit_and_new_mappings(self) -> None:
+        self.open("fn answer() -> i32 { return 1; }\n")
+        view = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "aether/getViews",
+                "params": {"textDocument": {"uri": self.uri}},
+            }
+        )["result"]["ai"]
+        start = view.index("1")
+        response = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "aether/applyAIViewEdits",
+                "params": {
+                    "textDocument": {"uri": self.uri},
+                    "version": 1,
+                    "newVersion": 2,
+                    "edits": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": start},
+                                "end": {"line": 0, "character": start + 1},
+                            },
+                            "newText": "2",
+                        }
+                    ],
+                },
+            }
+        )["result"]
+
+        self.assertTrue(response["accepted"])
+        self.assertEqual(response["version"], 2)
+        document_edit = response["workspaceEdit"]["documentChanges"][0]
+        self.assertEqual(document_edit["textDocument"]["version"], 1)
+        self.assertEqual(
+            document_edit["edits"][0]["newText"],
+            "fn answer() -> i32 {\n    return 2;\n}\n",
+        )
+        self.assertTrue(response["mappings"])
+        self.assertEqual(self.server.documents[self.uri].version, 1)
+
+        notification = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": self.uri, "version": 2},
+                    "contentChanges": [{"text": document_edit["edits"][0]["newText"]}],
+                },
+            }
+        )
+        self.assertEqual(notification["params"]["version"], 2)
+
+    def test_apply_ai_view_edits_rejects_stale_version_and_bad_syntax(self) -> None:
+        self.open("fn answer() -> i32 { return 1; }\n")
+        result = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "aether/applyAIViewEdits",
+                "params": {
+                    "textDocument": {"uri": self.uri},
+                    "version": 0,
+                    "newVersion": 2,
+                    "edits": [],
+                },
+            }
+        )
+        self.assertIn("Stale AI-view edit", result["error"]["message"])
+
+        view = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 23,
+                "method": "aether/getViews",
+                "params": {"textDocument": {"uri": self.uri}},
+            }
+        )["result"]["ai"]
+        body_start = view.index(")") + 1
+        start = view.index("ret", body_start)
+        invalid = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 24,
+                "method": "aether/applyAIViewEdits",
+                "params": {
+                    "textDocument": {"uri": self.uri},
+                    "version": 1,
+                    "newVersion": 2,
+                    "edits": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": start},
+                                "end": {"line": 0, "character": start + len("ret")},
+                            },
+                            "newText": "invalid",
+                        }
+                    ],
+                },
+            }
+        )["result"]
+        self.assertFalse(invalid["accepted"])
+        self.assertTrue(invalid["diagnostics"])
+
+    def test_apply_ai_view_edits_rejects_out_of_range_edits(self) -> None:
+        self.open("fn answer() -> i32 { return 1; }\n")
+        view = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 25,
+                "method": "aether/getViews",
+                "params": {"textDocument": {"uri": self.uri}},
+            }
+        )["result"]["ai"]
+        response = self.server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 26,
+                "method": "aether/applyAIViewEdits",
+                "params": {
+                    "textDocument": {"uri": self.uri},
+                    "version": 1,
+                    "newVersion": 2,
+                    "edits": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": len(view) + 1},
+                                "end": {"line": 0, "character": len(view) + 2},
+                            },
+                            "newText": "x",
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertIn("outside line", response["error"]["message"])
+
     def test_incremental_change_invalidates_only_modified_document_cache(self) -> None:
         other_uri = "file:///workspace/other.hl"
         self.open("fn first() {}\n")

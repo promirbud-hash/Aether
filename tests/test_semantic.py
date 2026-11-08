@@ -7,6 +7,16 @@ from src.semantic import analyze
 
 
 class SemanticTests(unittest.TestCase):
+    def test_bitwise_operators_require_matching_unitless_integers(self) -> None:
+        result = parse_source(
+            "fn float_bits(value: f32) -> f32 { return value & 1.0; }\n"
+            "fn mixed_bits(left: i32, right: u32) -> i32 { return left ^ right; }\n"
+            "fn unit_bits(value: i32<m>) -> i32<m> { return value << value; }\n"
+        )
+        codes = [item.code for item in result.diagnostics]
+
+        self.assertEqual(codes.count("E_BITWISE_TYPE"), 3)
+
     def test_frame_buffer_containing_locals_cannot_be_const_or_annotated(self) -> None:
         result = parse_source(
             "fn direct_const(size: u64) {\n"
@@ -72,7 +82,11 @@ class SemanticTests(unittest.TestCase):
             item for item in result.diagnostics
             if item.code == "E_UNSUPPORTED_TYPE"
         ]
-        self.assertEqual(len(unsupported), 4)
+        self.assertEqual(len(unsupported), 3)
+        self.assertIn(
+            "E_RETURN_TYPE",
+            [item.code for item in result.diagnostics],
+        )
         with self.assertRaises(CompilationError):
             compile_source(
                 "type HasPool { value: Pool, }\n"
@@ -124,6 +138,20 @@ class SemanticTests(unittest.TestCase):
             sum(item.code == "E_ASSIGN_IMMUTABLE" for item in result.diagnostics),
             2,
         )
+
+    def test_compound_assignment_requires_mutable_numeric_binding(self) -> None:
+        valid = parse_source(
+            "fn update() -> i32 { var value = 1; value += 2; return value; }\n"
+        )
+        self.assertEqual(valid.diagnostics, ())
+
+        invalid = parse_source(
+            "fn immutable() { let value = 1; value += 2; }\n"
+            "fn non_numeric() { var value = true; value += true; }\n"
+        )
+        codes = [item.code for item in invalid.diagnostics]
+        self.assertIn("E_ASSIGN_IMMUTABLE", codes)
+        self.assertIn("E_COMPOUND_ASSIGN_TYPE", codes)
 
     def test_sensor_pipeline_infers_tensor_units_and_cancels_normalization_unit(self) -> None:
         source = (
@@ -501,6 +529,34 @@ class SemanticTests(unittest.TestCase):
             2,
         )
 
+    def test_ffi_byte_slices_are_parameter_only_and_mutable_slices_require_var(self) -> None:
+        valid = parse_source(
+            '@ffi @link("native") extern "C" fn inspect(data: Slice<u8>) -> i32;\n'
+            '@ffi @link("native") extern "C" fn update(data: SliceMut<u8>) -> void;\n'
+        )
+        invalid_return = parse_source(
+            '@ffi @link("native") extern "C" fn get() -> Slice<u8>;\n'
+        )
+        invalid_storage = parse_source(
+            "fn keep(data: Slice<u8>) -> void {}\n"
+        )
+        immutable_buffer = parse_source(
+            '@ffi @link("native") extern "C" fn update(data: SliceMut<u8>) -> void;\n'
+            "@ffi fn caller(data: Tensor<u8, [4]>) -> void { update(data); }\n"
+        )
+
+        self.assertFalse(
+            [item for item in valid.diagnostics if item.severity == "error"]
+        )
+        self.assertIn("E_FFI_TYPE", [item.code for item in invalid_return.diagnostics])
+        self.assertFalse(
+            [item for item in invalid_storage.diagnostics if item.severity == "error"]
+        )
+        self.assertIn(
+            "E_FFI_MUTABILITY",
+            [item.code for item in immutable_buffer.diagnostics],
+        )
+
     def test_ffi_rejects_pure_or_malformed_library_declarations(self) -> None:
         pure_extern = parse_source(
             '@pure\n@ffi\n@link("sensor")\n'
@@ -738,6 +794,52 @@ class SemanticTests(unittest.TestCase):
             "E_OPTIONAL_MEMBER_UNSUPPORTED",
             [item.code for item in result.diagnostics],
         )
+
+    def test_struct_initializers_validate_fields(self) -> None:
+        result = parse_source(
+            "type Point { x: i32, y: i32, }\n"
+            "fn valid() -> Point { return Point { y: 2, x: 1 }; }\n"
+            "fn missing() -> Point { return Point { x: 1 }; }\n"
+            "fn duplicate() -> Point { return "
+            "Point { x: 1, x: 2, y: 3 }; }\n"
+            'fn mismatched() -> Point { return '
+            'Point { x: "one", y: 2 }; }\n'
+            "fn immutable() { let point = Point { x: 1, y: 2 }; "
+            "point.x = 3; }\n"
+        )
+
+        codes = [item.code for item in result.diagnostics]
+        self.assertIn("E_STRUCT_FIELD_MISSING", codes)
+        self.assertIn("E_STRUCT_FIELD_DUPLICATE", codes)
+        self.assertIn("E_STRUCT_FIELD_TYPE", codes)
+        self.assertIn("E_ASSIGN_IMMUTABLE", codes)
+
+    def test_collection_contract_types_and_mutability(self) -> None:
+        valid = parse_source(
+            "fn get_value(values: Array<i32, [2]>) -> "
+            "Result<i32, CollectionError> { return get(values, 0); }\n"
+            "fn build() -> List<i32> {\n"
+            "  var values: List<i32> = List();\n"
+            "  let changed = match append(values, 4) { Ok(_) => 0, Err(_) => -1 };\n"
+            "  let copied: List<i32> = List([1, 2]);\n"
+            "  return copied;\n"
+            "}\n"
+        )
+        self.assertEqual(valid.diagnostics, ())
+
+        invalid = parse_source(
+            "fn bad(values: List<i32>) {\n"
+            "  let changed = append(values, 1);\n"
+            "  let element = values[0];\n"
+            "}\n"
+            "fn wrong() { let values: Array<i32, [2]> = [1]; }\n"
+            "fn nested() { let values: List<str> = List(); }\n"
+        )
+        codes = [item.code for item in invalid.diagnostics]
+        self.assertIn("E_COLLECTION_MUTABILITY", codes)
+        self.assertIn("E_COLLECTION_INDEX", codes)
+        self.assertIn("E_ARRAY_LITERAL_LENGTH", codes)
+        self.assertIn("E_COLLECTION_ELEMENT", codes)
 
     def test_coalescing_operator_is_rejected_until_option_semantics_exist(self) -> None:
         result = parse_source(

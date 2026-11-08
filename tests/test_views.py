@@ -5,8 +5,10 @@ import unittest
 
 from src.ai_view import (
     TokenizerProfile,
+    ai_view_to_source,
     create_encoder,
     default_profile,
+    expand_ai_view,
     generate_ai_view,
     load_profiles,
 )
@@ -22,6 +24,7 @@ from src.codemap import (
     render_active_slice,
     render_map,
 )
+from src.frontend import parse_source, render_module
 from src.parser import parse
 
 
@@ -41,6 +44,43 @@ class ViewTests(unittest.TestCase):
         self.assertIn("≫=|>", view)
         self.assertNotIn("// Sensor data", view)
         self.assertNotIn("\n", view)
+
+    def test_ai_view_aliases_expand_to_canonical_source(self) -> None:
+        source = (
+            "fn measure(value: i32) -> i32 {\n"
+            "  let centered = value;\n"
+            "  return centered + centered;\n"
+            "}\n"
+        )
+        profile = default_profile()
+        view = generate_ai_view(parse(source), profile)
+
+        self.assertIn("centered", view.split(")", 1)[0])
+        self.assertEqual(
+            ai_view_to_source(view, profile),
+            "fn measure(value: i32) -> i32 {\n"
+            "    let centered = value;\n"
+            "    return centered + centered;\n"
+            "}\n",
+        )
+
+    def test_sample_ai_view_roundtrips_to_canonical_source(self) -> None:
+        expected = render_module(parse_source(self.source).ast)
+        view = generate_ai_view(self.tree)
+
+        self.assertEqual(ai_view_to_source(view), expected)
+
+    def test_ai_view_rejects_missing_stale_and_duplicate_alias_headers(self) -> None:
+        profile = default_profile()
+        with self.assertRaisesRegex(ValueError, "missing"):
+            expand_ai_view("fn f() {}", profile)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            expand_ai_view("@a(other-profile;)fn f(){}", profile)
+        with self.assertRaisesRegex(ValueError, "duplicate alias"):
+            expand_ai_view(
+                f"@a({profile.name};rtn=return,rtn=return)ret;",
+                profile,
+            )
 
     def test_codemap_contains_declarations_permissions_units_and_calls(self) -> None:
         code_map = build_codemap(self.tree)

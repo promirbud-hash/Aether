@@ -1,15 +1,122 @@
-# Aether prototype
+# Aether
 
-The initial Python prototype explores lossless `.hl` parsing, compact AI views,
-code topology, and tokenizer-based size comparisons.
+**A small, statically checked programming language prototype with a Python
+reference interpreter and a C99 backend.**
+
+Aether is being developed toward a practical, portable language whose programs
+can be checked and executed consistently in an interpreter and compiled to
+native C. The repository also explores lossless `.hl` editing, compact AI
+views, code topology, and tokenizer-based size comparisons.
+
+> **Project status:** experimental prototype, not a 1.0 release and not a
+> Python-compatible implementation. The language and backend deliberately
+> support a documented subset; they diagnose unsupported features rather than
+> promising general-purpose behavior.
+
+## Goals and design assumptions
+
+- **A usable language core first.** Grow syntax, types, control flow,
+  structures, collections, and runtime features as coherent end-to-end slices.
+- **Comparable execution paths.** The interpreter is the reference behavior;
+  supported C99 constructs should be checked against it with tests.
+- **Explicit limits and failures.** Document ownership, effects, and backend
+  boundaries. Reject unsupported constructs with diagnostics instead of
+  emitting plausible but incorrect code.
+- **Portable output.** Use C99 as a practical compilation target, with an
+  embedded/freestanding profile as a separate, explicitly validated subset.
+- **Self-compilation is a future milestone.** It is a goal to measure with
+  bootstrap stages, not a capability claimed by this repository today.
+- **AI views are developer tooling.** `.ai` views and topology maps are
+  deterministic representations of source; they do not change program
+  semantics or replace `.hl` as the source of truth.
+
+The project is intentionally not trying to implement all of Python, nor to
+promise GUI frameworks, concurrency, or a broad standard library before real
+programs establish their requirements.
+
+## Current state at a glance
+
+| Area | Current status |
+|---|---|
+| Language | Functions, static types, units, effects, `Result`, control flow, bounded structs, tensors, and collections are implemented to varying documented limits. |
+| Runtime | The interpreter supports console and project-root file I/O, arguments, injectable handlers, and a bounded ownership model. |
+| C99 | A useful but incomplete subset has native builds, typed diagnostics, integer tensors, autodiff, FFI, and host runtime support. It is not feature-identical to the interpreter. |
+| Embedded | Freestanding C99 objects have been cross-compiled with LLVM Clang for ARM Cortex-M0+/M4, RISC-V32, and AVR. A full board SDK firmware link/run is not yet claimed. |
+| AI views and LSP | Lossless source/CST, Tri-View support, offline LSP, and versioned `.ai` edit proposals are implemented as prototype tooling. |
+| Self-compile | Not started. There is no Aether-written compiler or bootstrap test suite yet. |
+
+Collection allocation-failure parity, broader backend conformance, a unified
+end-user CLI, and a fuller standard library remain open work. See the
+[roadmap](docs/roadmap.md) for status and priorities.
+
+## A small example
+
+The Python API can compile and execute a function in the supported subset:
+
+```python
+from src.api import run_source
+
+program = """
+fn sum_to(limit: i32) -> i32 {
+    var total = 0;
+    for index in 0..limit {
+        total += index;
+    }
+    return total;
+}
+"""
+
+print(run_source(program, "sum_to", 5))  # 10
+```
+
+`emit_c99(source)` emits C99 for supported constructs. `run_source` is useful
+for prototyping and testing; it is not a security sandbox or a production
+runtime. See the [language subset](docs/aether-subset.md) for exact semantics.
 
 ## Setup and tests
+
+The project supports Python 3.10 and newer. CI runs the GCC/Clang test matrix
+on Python 3.13 and the Python package/lint workflow on Python 3.10. Python
+3.10+ is required for the language tooling and tests; `requirements.txt`
+contains `tiktoken`, needed by the default exact-tokenizer benchmark. Install
+the development dependencies as well if you want to run the optional pytest
+and lint workflows:
 
 ```powershell
 py -3.10 -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+The standard-library `unittest` suite is the canonical test command. Native
+C99 tests require the selected compiler to be on `PATH`; these commands make
+the compiler mandatory so a missing compiler fails instead of silently
+skipping native tests:
+
+```powershell
+$env:AETHER_REQUIRE_C99_COMPILER = "1"
+$env:AETHER_C99_COMPILER = "gcc"
+.\venv\Scripts\python.exe -m unittest discover -s tests -v
+
+$env:AETHER_C99_COMPILER = "clang"
+.\venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+Run Python syntax and whitespace checks separately when validating a change:
+
+```powershell
+.\venv\Scripts\python.exe -m compileall -q src tests
+git diff --check
+```
+
+`pytest` and `flake8` are development-only tools used by the secondary package
+workflow; they are not needed to run the canonical unittest suite.
+`transformers` is optional and is needed only for Qwen/Llama tokenizer profiles;
+those profiles use locally cached models and do not download them. MSVC,
+CUDA/NVCC, and a CUDA-capable GPU are optional: tests depending on unavailable
+toolchains or hardware are skipped, which is not evidence that those targets
+passed validation.
 
 ## Generate views and benchmark
 
@@ -53,9 +160,14 @@ Start the standard-I/O language server with:
 
 The server supports UTF-16 LSP ranges, incremental `didChange`, push and pull
 diagnostics, and document-scoped cache invalidation. Custom requests are
-`aether/getViews`, `aether/sourcePosition`, and `aether/viewPosition`. The view
-request can choose a tokenizer profile and active map node; returned mappings
-relate each emitted token (including aliases) to source and view ranges.
+`aether/getViews`, `aether/sourcePosition`, `aether/viewPosition`, and
+`aether/applyAIViewEdits`. The view request can choose a tokenizer profile and
+active map node; returned mappings relate each emitted token (including
+aliases) to source and view ranges. `applyAIViewEdits` validates edits against
+the current `.ai` view and document version, expands aliases, and returns a
+versioned full-document `WorkspaceEdit` plus candidate diagnostics and mappings.
+The client applies the edit and reports it through the normal `didChange`
+notification.
 LSP generation is deliberately offline: it uses the profile's stable fallback
 alias ordering and does not initialize or download tokenizer/model packages.
 For tokenizer-optimized output use the benchmark/generator API with an explicit
@@ -73,96 +185,63 @@ environment and are not performance guarantees. It defaults to the offline,
 deterministic phraser path; add `--tokenizer-optimized` to separately measure
 the slower tokenizer-guided alias search.
 
-The CST preserves exact source text, and the deterministic frontend builds
-syntax-aware declaration nodes plus an AST for the documented v0 subset.
-`docs/aether-subset.md` records that grammar and its current semantic checks.
-The analyzer reports syntax errors, duplicate declarations/bindings, unknown
-local names/calls, type and call mismatches, invalid tensor dimensions, unit
-incompatibilities, and undeclared transitive effects. Its bounded inference
-covers the documented expression subset; it is not a complete compiler type
-system. The map extractor uses AST declarations, effects, recognized units,
-calls, and function-to-type references.
-The stable Python entry points are `compile_source` and `run_source` in
-`src.api`; compilation fails with diagnostics rather than executing an invalid
-module. The reference interpreter validates function-boundary primitive,
-struct, tensor, and `Result` payloads for the supported subset.
-For multi-file projects, `compile_project(entry_path)` loads relative `.hl`
-imports and returns a combined typed IR; `run_project(entry_path, function_name,
-...)` runs an entry-module function. `emit_c99_project`,
-`build_project_object`, and `build_project_executable` provide the supported
-Safe-C99 build path for projects. Imports use qualified names (`alias::function`
-and `alias::Type`) and reject cycles. Workspace/LSP import resolution is not
-yet supported. Import paths resolve from the importing file and must remain
-inside the entry file's directory; the same module may be imported through
-multiple distinct aliases. `build_project_object` emits one combined C
-translation unit, while `build_project_executable` compiles each source module
-separately and links the resulting objects. `build_project_objects` writes a
-separately linkable object per source module to a new output directory and
-returns a mapping from relative source paths to object paths;
-`link_project_objects` validates the generated manifest, source and object
-hashes against the current project before linking with explicitly configured
-FFI libraries.
-Unit conversions are explicit (`convert(value, "m")`) and are represented as
-rational scale/offset operations (plus a symbolic pi power for angular units)
-in semantic results and executed by the reference interpreter. Its typed IR
-preserves source spans, inferred expression types, effects, and conversion
-metadata.
-SI prefixes and compound unit expressions are supported in numeric and tensor
-type annotations, with exact rational scales and `µ` normalized to `u`.
-`convert` accepts the same compound expressions. The registry remains finite;
-see [`docs/unit-prefix-design.md`](docs/unit-prefix-design.md) and
-[`docs/aether-subset.md`](docs/aether-subset.md) for the supported subset.
-Absolute-temperature arithmetic is rejected rather than implicitly
-approximated. Effect annotations currently describe the effect contract
-checked against effects inferred from the built-ins `io_write`, `io_read_line`,
-`fs_read_text`, `fs_write_text`, `fs_exists`, `net_get`, and `net_post`, then
-propagated through calls. These built-ins return typed `Result<T, Error>`
-values. The reference interpreter executes `Result` matching and `?`, but
-those operations are inert unless an embedding caller injects a handler that
-returns `ResultValue`. No real file, network, or console access occurs by
-default.
-`Result<T, E>` has a restricted exhaustive `match` expression over `Ok` and
-`Err`, plus postfix `?` for propagating the same error type from a function
-returning `Result`. The reference interpreter supports this subset along with
-scalar/tensor arithmetic and unit conversion. Its role is executable
-prototyping, not a production runtime or memory-safety boundary. See
-`docs/aether-subset.md` for the supported operations and limitations.
-The prototype also parses typed `extern "C"` declarations with `@link` and
-checks the `@ffi` effect. Interpreter tests can provide explicit
-`external_handlers`; no shared library is loaded and no linker is run. The
-supported ABI types and current limitations are documented in
-`docs/aether-subset.md`.
+## Language and runtime
 
-The experimental Safe-C99 backend is available as `emit_c99(source)` from
-`src.api`. It emits deterministic C99 for a checked scalar and static
-`f32`/`f64` tensor subset and rejects unsupported features with diagnostics.
-`build_object(source, output_path)` compiles that subset to a host object file.
-`build_executable(source, output_path)` links a program whose entry point is
-`fn main() -> i32` or
-`fn main() -> void`. Native C ABI calls require explicit `libraries` mappings
-from each `@link` name to a linker-compatible file. The build APIs do not
-dynamically load libraries or run generated programs. See
-`docs/aether-subset.md` for the supported operations and limitations.
-The consolidated roadmap, current milestone statuses, and next ownership
-gates are in [`docs/roadmap.md`](docs/roadmap.md).
-The product-facing transition plan from prototype to a supportable release is
-in [`docs/roadmap_v2.md`](docs/roadmap_v2.md).
-The scalar and bounded tensor reverse-mode
-`gradient(function_name, input)` intrinsic is implemented for the subset
-documented in [`docs/aether-subset.md`](docs/aether-subset.md).
-An experimental, opt-in CUDA `.cu` emitter supports a narrow unitless `f32`
-elementwise tensor subset; its generated host wrapper requires an accessible
-CUDA device and never falls back to CPU. See
-[`docs/cuda-backend-design.md`](docs/cuda-backend-design.md).
-The memory/ownership baseline is accepted. Its bounded `FrameBuffer` ARC
-increment is implemented in the analyzer, typed IR, interpreter, and C99
-backend: one reference per owning binding, borrowed parameters, owned returns,
-explicit temporary lifetimes, and retain-before-release rebinding. General
-ARC, COW, arbitrary destructors, and ownership-bearing FFI remain out of scope.
-A bounded inline scalar `Result` subset and C99 `?` cleanup epilogue are
-implemented; the tensor autodiff tape has a narrow invocation-local allocation
-policy.
-See [`docs/autodiff-tensor-contract.md`](docs/autodiff-tensor-contract.md),
-[`docs/unit-prefix-design.md`](docs/unit-prefix-design.md), and
-[`docs/memory-ownership-design.md`](docs/memory-ownership-design.md) for their
-distinct statuses and limitations.
+The lossless CST preserves the exact `.hl` source. The syntax-aware frontend,
+semantic checks, and typed IR cover the documented subset, including
+`if`/`else`, loops, ranges, scoped bindings, `Result`, units and effects,
+value-semantic structs, static tensors, and a bounded collection API.
+Unsupported syntax and backend operations produce diagnostics. This is not a
+complete type system or a claim that every feature behaves identically on all
+targets.
+
+The main Python API is in `src.api`:
+
+- `compile_source(source)` returns typed IR or raises `CompilationError`.
+- `run_source(source, function_name, *arguments)` executes a function with the
+  reference interpreter.
+- `compile_project(entry_path)` and `run_project(...)` handle restricted
+  relative imports and qualified names such as `math::sum`.
+
+The interpreter provides console I/O, project-root-confined file operations,
+and process arguments, with injectable streams and handlers for testing and
+embedding. Network calls remain handler-only. Strings use UTF-8. Runtime
+behavior and ownership guarantees are bounded by the contracts in
+[`docs/aether-subset.md`](docs/aether-subset.md) and
+[`docs/memory-ownership-design.md`](docs/memory-ownership-design.md).
+
+## C99 and embedded targets
+
+`emit_c99(source)` generates deterministic C99 for the supported subset.
+`build_object` and `build_executable` compile and link host programs;
+multi-module equivalents and manifest-checked object workflows are also
+available. FFI libraries require explicit `@link` mappings. The C99 backend
+does not silently replace unsupported language operations.
+
+The separate `@target(mcu)` profile emits freestanding code, rejects hosted
+runtime calls and dynamic collections, and supports a bounded set of integer
+tensors and borrowed byte-buffer FFI parameters. Generated objects have been
+cross-compiled with LLVM Clang for several embedded target triples. This does
+not mean Aether supplies board startup, drivers, linker scripts, or a complete
+SDK build. See the [Pico SDK example](examples/embedded/pico/README.md) and
+[roadmap](docs/roadmap.md).
+
+Scalar and bounded tensor reverse-mode autodiff are implemented for the
+documented subset. A separate experimental CUDA emitter supports only a narrow
+unitless `f32` elementwise subset and requires a CUDA device; it has no CPU
+fallback. See the [autodiff contract](docs/autodiff-tensor-contract.md) and
+[CUDA design](docs/cuda-backend-design.md).
+
+## Further reading
+
+- [Language subset and runtime contract](docs/aether-subset.md)
+- [Development roadmap and status](docs/roadmap.md)
+- [Prototype-to-release roadmap](docs/roadmap_v2.md)
+- [Collections and ownership](docs/memory-ownership-design.md)
+- [Tensor autodiff contract](docs/autodiff-tensor-contract.md)
+- [Units](docs/unit-prefix-design.md)
+- [CUDA backend](docs/cuda-backend-design.md)
+
+There is not yet a unified end-user CLI, a broad standard library, or an
+Aether-written self-hosting compiler. Those are future work, not implied by
+the current prototype.

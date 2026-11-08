@@ -10,11 +10,21 @@ import re
 import struct
 import sys
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from pathlib import Path
+from typing import BinaryIO, Callable, Mapping
 
 from src.frontend import Module
 from src.ir import IRExpression, IRFunction, IRModule, lower_module
 from src.semantic import AetherType, SemanticResult, UnitConversion
+from src.runtime import (
+    ArgsErrorCode,
+    CollectionErrorCode,
+    FsErrorCode,
+    IoErrorCode,
+    ProjectPathError,
+    ProjectPathNotFound,
+    resolve_project_path,
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +103,93 @@ class _FrameBuffer:
             self._storage.data.clear()
 
 
+class ByteSlice:
+    """Non-owning byte view passed to an injected extern-function handler."""
+
+    def __init__(
+        self,
+        data: list[object] | bytearray | bytes,
+        *,
+        mutable: bool,
+    ) -> None:
+        self._data = data
+        self._mutable = mutable
+        self._active = True
+
+    def _ensure_active(self) -> None:
+        if not self._active:
+            raise AetherRuntimeError("Byte slice used after extern call completed")
+
+    def invalidate(self) -> None:
+        self._active = False
+
+    def __len__(self) -> int:
+        self._ensure_active()
+        return len(self._data)
+
+    def __getitem__(self, index: int | slice) -> object:
+        self._ensure_active()
+        return self._data[index]
+
+    def __setitem__(self, index: int, value: int) -> None:
+        self._ensure_active()
+        if not self._mutable:
+            raise TypeError("cannot mutate an immutable Slice<u8>")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value <= 255
+        ):
+            raise ValueError("SliceMut<u8> values must be in the range 0..255")
+        if isinstance(self._data, list):
+            self._data[index] = value
+        elif isinstance(self._data, bytearray):
+            self._data[index] = value
+        else:
+            raise TypeError("SliceMut<u8> requires mutable backing storage")
+
+    def to_bytes(self) -> bytes:
+        self._ensure_active()
+        return bytes(self._data)
+
+
+class _CowListStorage:
+    def __init__(self, values: list[object]) -> None:
+        self.values = values
+        self.references = 1
+
+
+class _CowList:
+    def __init__(
+        self,
+        values: list[object] | None = None,
+        *,
+        storage: _CowListStorage | None = None,
+    ) -> None:
+        self._storage = storage or _CowListStorage(values or [])
+
+    @property
+    def values(self) -> list[object]:
+        return self._storage.values
+
+    def clone(self) -> _CowList:
+        self._storage.references += 1
+        return _CowList(storage=self._storage)
+
+    def make_unique(self, clone_value: Callable[[object], object]) -> list[object]:
+        storage = self._storage
+        if storage.references > 1:
+            copied = [clone_value(value) for value in storage.values]
+            storage.references -= 1
+            self._storage = _CowListStorage(copied)
+        return self._storage.values
+
+    def __del__(self) -> None:
+        storage = getattr(self, "_storage", None)
+        if storage is not None:
+            storage.references -= 1
+
+
 class AetherRuntimeError(RuntimeError):
     """A runtime failure with the source span of its Aether operation."""
 
@@ -100,6 +197,14 @@ class AetherRuntimeError(RuntimeError):
 class _PropagateResult(Exception):
     def __init__(self, result: ResultValue) -> None:
         self.result = result
+
+
+class _BreakLoop(Exception):
+    pass
+
+
+class _ContinueLoop(Exception):
+    pass
 
 
 EffectHandler = Callable[..., ResultValue]
@@ -232,6 +337,13 @@ class Interpreter:
         "io_write", "io_read_line", "fs_read_text", "fs_write_text",
         "fs_exists", "net_get", "net_post",
     }
+    _HOST_IO_BUILTINS = {
+        "io_write",
+        "io_read_line",
+        "fs_read_text",
+        "fs_write_text",
+        "fs_exists",
+    }
 
     def __init__(
         self,
@@ -240,6 +352,10 @@ class Interpreter:
         effect_handlers: Mapping[str, EffectHandler] | None = None,
         external_handlers: Mapping[str, ExternalFunctionHandler] | None = None,
         max_call_depth: int = 128,
+        stdin: BinaryIO | None = None,
+        stdout: BinaryIO | None = None,
+        project_root: str | Path | None = None,
+        program_args: tuple[str, ...] = (),
     ) -> None:
         if max_call_depth < 1:
             raise ValueError("max_call_depth must be positive")
@@ -247,11 +363,22 @@ class Interpreter:
         self.effect_handlers = dict(effect_handlers or {})
         self.external_handlers = dict(external_handlers or {})
         self.max_call_depth = max_call_depth
+        self.stdin = stdin if stdin is not None else sys.stdin.buffer
+        self.stdout = stdout if stdout is not None else sys.stdout.buffer
+        self.project_root = Path(project_root or Path.cwd()).expanduser().resolve()
+        self.program_args = tuple(program_args)
         self._call_depth = 0
         self._frame_resources: list[list[object | None]] = []
         self._frame_resource_slots: list[dict[str, int]] = []
         self._temporary_resources: list[list[object]] = []
         self._functions = {function.name: function for function in module.functions}
+        self._external_symbol_counts: dict[str, int] = {}
+        for function in module.functions:
+            if function.external_abi is not None:
+                symbol = function.external_symbol or function.name
+                self._external_symbol_counts[symbol] = (
+                    self._external_symbol_counts.get(symbol, 0) + 1
+                )
         self._types = {type_.name: type_ for type_ in module.types}
 
     @classmethod
@@ -263,12 +390,20 @@ class Interpreter:
         effect_handlers: Mapping[str, EffectHandler] | None = None,
         external_handlers: Mapping[str, ExternalFunctionHandler] | None = None,
         max_call_depth: int = 128,
+        stdin: BinaryIO | None = None,
+        stdout: BinaryIO | None = None,
+        project_root: str | Path | None = None,
+        program_args: tuple[str, ...] = (),
     ) -> Interpreter:
         return cls(
             lower_module(source_module, semantics),
             effect_handlers=effect_handlers,
             external_handlers=external_handlers,
             max_call_depth=max_call_depth,
+            stdin=stdin,
+            stdout=stdout,
+            project_root=project_root,
+            program_args=program_args,
         )
 
     def run(self, function_name: str, *arguments: object, **keywords: object) -> object:
@@ -315,16 +450,35 @@ class Interpreter:
                 f"{function.name} is missing argument(s): {', '.join(missing)}"
             )
         if function.external_abi is not None:
+            symbol = function.external_symbol or function.name
+            library_handler_name = (
+                f"{function.external_library}:{symbol}"
+                if function.external_library is not None
+                else symbol
+            )
             handler = self.external_handlers.get(function.name)
             if handler is None:
+                handler = self.external_handlers.get(library_handler_name)
+            if (
+                handler is None
+                and self._external_symbol_counts.get(symbol) == 1
+            ):
+                handler = self.external_handlers.get(symbol)
+            if handler is None:
                 raise AetherRuntimeError(
-                    f"Extern function {function.name!r} from library "
+                    f"Extern function {symbol!r} from library "
                     f"{function.external_library!r} has no injected handler; "
                     "the reference interpreter does not load native libraries"
                 )
-            result = handler(
-                *(environment[parameter.name] for parameter in function.parameters)
+            external_arguments = tuple(
+                environment[parameter.name] for parameter in function.parameters
             )
+            try:
+                result = handler(*external_arguments)
+            finally:
+                for argument in external_arguments:
+                    if isinstance(argument, ByteSlice):
+                        argument.invalidate()
             return self._prepare_output(
                 result,
                 function.return_type,
@@ -461,6 +615,42 @@ class Interpreter:
                 f"{type_.display()}: {error}"
             ) from error
 
+    def _copy_struct_value(
+        self,
+        value: object,
+        type_: AetherType,
+    ) -> object:
+        declaration = self._types.get(type_.name)
+        if declaration is None or not isinstance(value, Mapping):
+            return value
+        return {
+            field_name: self._copy_typed_value(value[field_name], field_type)
+            for field_name, field_type in declaration.fields
+        }
+
+    def _copy_typed_value(self, value: object, type_: AetherType) -> object:
+        declaration = self._types.get(type_.name)
+        if declaration is not None:
+            return self._copy_struct_value(value, type_)
+        if type_.name == "List" and isinstance(value, _CowList):
+            return value.clone()
+        if type_.name in {"Array", "Slice"} and isinstance(value, list):
+            if not type_.arguments:
+                return list(value)
+            return [
+                self._copy_typed_value(item, type_.arguments[0])
+                for item in value
+            ]
+        if type_.name == "Tensor":
+            return self._copy_tensor_nested(value)
+        return value
+
+    @staticmethod
+    def _copy_tensor_nested(value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        return [Interpreter._copy_tensor_nested(item) for item in value]
+
     def _prepare_input(
         self,
         value: object,
@@ -470,10 +660,87 @@ class Interpreter:
     ) -> object:
         if type_.name == "Result":
             return self._prepare_result(value, type_, function, parameter)
+        if type_.name == "Array":
+            if len(type_.dimensions) != 1 or not type_.arguments:
+                raise TypeError(f"{function}.{parameter} has an invalid Array type")
+            if not isinstance(value, (list, tuple)):
+                raise TypeError(f"{function}.{parameter} expects array data")
+            if len(value) != type_.dimensions[0]:
+                raise TypeError(
+                    f"{function}.{parameter} expects {type_.dimensions[0]} "
+                    f"elements, got {len(value)}"
+                )
+            return [
+                self._prepare_input(
+                    item,
+                    type_.arguments[0],
+                    function,
+                    f"{parameter}[{index}]",
+                )
+                for index, item in enumerate(value)
+            ]
+        if type_.name == "List":
+            if not type_.arguments:
+                raise TypeError(f"{function}.{parameter} has an invalid List type")
+            if isinstance(value, _CowList):
+                return value.clone()
+            if not isinstance(value, (list, tuple)):
+                raise TypeError(f"{function}.{parameter} expects list data")
+            try:
+                copied = [
+                    self._prepare_input(
+                        item,
+                        type_.arguments[0],
+                        function,
+                        f"{parameter}[{index}]",
+                    )
+                    for index, item in enumerate(value)
+                ]
+            except (MemoryError, OverflowError) as error:
+                raise TypeError(f"{function}.{parameter} list copy failed") from error
+            return _CowList(copied)
+        if type_.name == "Slice":
+            declaration = self._functions.get(function)
+            if declaration is not None and declaration.external_abi is not None:
+                wrapped = ByteSlice(value, mutable=False)
+                for index in range(len(wrapped)):
+                    self._validate_scalar(
+                        wrapped[index],
+                        AetherType("u8"),
+                        f"{function}.{parameter}[{index}]",
+                    )
+                return wrapped
+            if not type_.arguments or not isinstance(value, (list, tuple)):
+                raise TypeError(f"{function}.{parameter} expects owned slice data")
+            return [
+                self._prepare_input(
+                    item,
+                    type_.arguments[0],
+                    function,
+                    f"{parameter}[{index}]",
+                )
+                for index, item in enumerate(value)
+            ]
         if type_.name == "FrameBuffer":
             if not isinstance(value, _FrameBuffer) or value.released:
                 raise TypeError(f"{function}.{parameter} expects a live FrameBuffer")
             return value
+        if type_.name in {"Slice", "SliceMut"}:
+            mutable = type_.name == "SliceMut"
+            if not isinstance(value, (list, bytearray, bytes)):
+                raise TypeError(f"{function}.{parameter} expects a byte buffer")
+            if mutable and not isinstance(value, (list, bytearray)):
+                raise TypeError(
+                    f"{function}.{parameter} SliceMut<u8> requires mutable storage"
+                )
+            wrapped = ByteSlice(value, mutable=mutable)
+            for index in range(len(wrapped)):
+                self._validate_scalar(
+                    wrapped[index],
+                    AetherType("u8"),
+                    f"{function}.{parameter}[{index}]",
+                )
+            return wrapped
         if type_.name == "void":
             if value is not None:
                 raise TypeError(f"{function}.{parameter} expects no value")
@@ -604,7 +871,76 @@ class Interpreter:
         function: IRFunction,
         environment: dict[str, object],
     ) -> tuple[object, bool]:
-        for statement in function.body:
+        return self._execute_statements(function.body, environment)
+
+    def _execute_statements(
+        self,
+        statements: tuple[object, ...],
+        environment: dict[str, object],
+    ) -> tuple[object, bool]:
+        for statement in statements:
+            if statement.kind in {"if", "while", "for"}:
+                if statement.kind == "if":
+                    assert statement.expression is not None
+                    condition = self._evaluate(statement.expression, environment)
+                    selected = statement.body if condition else statement.else_body
+                    child = dict(environment)
+                    result, returned = self._execute_statements(selected, child)
+                    for name in environment:
+                        environment[name] = child[name]
+                    if returned:
+                        return result, True
+                elif statement.kind == "while":
+                    assert statement.expression is not None
+                    while self._evaluate(statement.expression, environment):
+                        child = dict(environment)
+                        try:
+                            result, returned = self._execute_statements(
+                                statement.body,
+                                child,
+                            )
+                        except _ContinueLoop:
+                            for name in environment:
+                                environment[name] = child[name]
+                            continue
+                        except _BreakLoop:
+                            for name in environment:
+                                environment[name] = child[name]
+                            break
+                        for name in environment:
+                            environment[name] = child[name]
+                        if returned:
+                            return result, True
+                else:
+                    start, end = (
+                        self._evaluate(expression, environment)
+                        for expression in statement.expressions
+                    )
+                    for index in range(start, end):
+                        child = dict(environment)
+                        child[statement.name] = index
+                        try:
+                            result, returned = self._execute_statements(
+                                statement.body,
+                                child,
+                            )
+                        except _ContinueLoop:
+                            for name in environment:
+                                environment[name] = child[name]
+                            continue
+                        except _BreakLoop:
+                            for name in environment:
+                                environment[name] = child[name]
+                            break
+                        for name in environment:
+                            environment[name] = child[name]
+                        if returned:
+                            return result, True
+                continue
+            if statement.kind == "break":
+                raise _BreakLoop
+            if statement.kind == "continue":
+                raise _ContinueLoop
             if statement.kind == "let":
                 assert statement.expression is not None
                 value = self._evaluate_statement_expression(
@@ -612,6 +948,7 @@ class Interpreter:
                     environment,
                     transfer=True,
                 )
+                value = self._copy_typed_value(value, statement.expression.type)
                 environment[statement.name] = value
                 if self._contains_frame_buffer(statement.expression.type):
                     slot = self._frame_resource_slots[-1].get(statement.name)
@@ -627,12 +964,50 @@ class Interpreter:
                     environment,
                     transfer=True,
                 )
+                if statement.field_name is not None:
+                    target = environment.get(statement.name)
+                    if not isinstance(target, dict):
+                        raise AetherRuntimeError(
+                            f"Invalid struct assignment target at line {statement.span.line}"
+                        )
+                    target[statement.field_name] = self._copy_typed_value(
+                        value,
+                        statement.expression.type,
+                    )
+                    continue
+                if statement.operator != "=":
+                    target_type = statement.expression.type
+                    compound_expression = IRExpression(
+                        "binary",
+                        statement.span,
+                        target_type,
+                        statement.operator[:-1],
+                        (
+                            IRExpression(
+                                "identifier",
+                                statement.span,
+                                target_type,
+                                statement.name,
+                            ),
+                            statement.expression,
+                        ),
+                    )
+                    value = self._binary(
+                        compound_expression.value,
+                        environment[statement.name],
+                        value,
+                        compound_expression,
+                    )
                 slot = self._frame_resource_slots[-1].get(statement.name)
                 if slot is not None:
                     old_value = self._frame_resources[-1][slot]
                     if old_value is not None:
                         self._release_owned_value(old_value)
                     self._frame_resources[-1][slot] = value
+                value = self._copy_typed_value(
+                    value,
+                    statement.expression.type,
+                )
                 environment[statement.name] = value
             elif statement.kind == "expression":
                 assert statement.expression is not None
@@ -666,7 +1041,12 @@ class Interpreter:
         if kind == "literal":
             return _round_to_type(self._literal(expression.value), expression.type)
         if kind == "identifier":
-            error_codes = {"IoError": 1, "FsError": 2, "NetError": 3}
+            error_codes = {
+                "IoError": 1,
+                "FsError": 2,
+                "NetError": 3,
+                "ArgsError": 4,
+            }
             if expression.value in error_codes:
                 return error_codes[expression.value]
             try:
@@ -682,6 +1062,16 @@ class Interpreter:
             raw = value.value if isinstance(value, Quantity) else value
             if expression.value == "!":
                 return not raw
+            if expression.value == "~":
+                width = (
+                    64
+                    if expression.type.name == "usize"
+                    else int(expression.type.name[1:])
+                )
+                bits = (~int(raw)) & ((1 << width) - 1)
+                if expression.type.name.startswith("i") and bits & (1 << (width - 1)):
+                    bits -= 1 << width
+                return self._wrap(bits, expression.type)
             result = _map_unary(raw, (lambda item: +item) if expression.value == "+" else (lambda item: -item))
             return self._wrap(result, expression.type)
         if kind == "try":
@@ -717,6 +1107,32 @@ class Interpreter:
         if kind == "gradient":
             input_value = self._evaluate(expression.children[0], environment)
             return self._evaluate_gradient(expression, input_value)
+        if kind == "struct_literal":
+            declaration = self._types.get(expression.type.name)
+            if declaration is None:
+                raise AetherRuntimeError(
+                    f"Unknown struct type {expression.type.name!r} "
+                    f"at line {expression.span.line}"
+                )
+            evaluated = {
+                name: self._evaluate(value_expression, environment)
+                for name, value_expression in zip(
+                    expression.field_names,
+                    expression.children,
+                )
+            }
+            return {
+                field_name: self._copy_typed_value(
+                    evaluated[field_name],
+                    field_type,
+                )
+                for field_name, field_type in declaration.fields
+            }
+        if kind == "array_literal":
+            return [
+                self._evaluate(value, environment)
+                for value in expression.children
+            ]
         if kind == "binary":
             if expression.value == "|>":
                 left = self._evaluate(expression.children[0], environment)
@@ -1141,6 +1557,19 @@ class Interpreter:
         arguments: list[object],
         expression: IRExpression,
     ) -> object:
+        if name == "List":
+            values = arguments[0] if arguments else []
+            if isinstance(values, _CowList):
+                return values.clone()
+            element_type = expression.type.arguments[0]
+            return _CowList(
+                [
+                    self._copy_typed_value(value, element_type)
+                    for value in values
+                ]
+            )
+        if name in {"get", "set", "slice", "append", "pop", "insert", "remove"}:
+            return self._invoke_collection(name, arguments, expression)
         if name == "frame_buffer" and len(arguments) == 1:
             size = arguments[0]
             if not isinstance(size, int) or isinstance(size, bool):
@@ -1172,12 +1601,27 @@ class Interpreter:
                 if self._contains_frame_buffer(expression.type)
                 else result
             )
+        if name == "args_len":
+            return len(self.program_args)
+        if name == "args_get":
+            index = arguments[0]
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise AetherRuntimeError("args_get index must be an integer")
+            if index < 0 or index >= len(self.program_args):
+                return ResultValue.err(int(ArgsErrorCode.OUT_OF_RANGE))
+            try:
+                self.program_args[index].encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                return ResultValue.err(int(ArgsErrorCode.INVALID_UTF8))
+            return ResultValue.ok(self.program_args[index])
         if name in self._EFFECTFUL_BUILTINS:
             if expression.type.name != "Result" or len(expression.type.arguments) != 2:
                 raise AetherRuntimeError(
                     f"Effect operation {name!r} has no typed Result IR"
                 )
             handler = self.effect_handlers.get(name)
+            if handler is None and name in self._HOST_IO_BUILTINS:
+                return self._run_host_io(name, arguments)
             if handler is None:
                 raise AetherRuntimeError(
                     f"Effectful operation {name!r} has no injected handler "
@@ -1210,6 +1654,212 @@ class Interpreter:
                 ) from error
             return ResultValue.ok(value)
         return self._pure_builtin(name, arguments, expression)
+
+    def _invoke_collection(
+        self,
+        name: str,
+        arguments: list[object],
+        expression: IRExpression,
+    ) -> ResultValue:
+        collection = arguments[0]
+        list_value = collection.values if isinstance(collection, _CowList) else collection
+        collection_type = expression.children[1].type
+        element_type = collection_type.arguments[0]
+
+        def clone_element(value: object) -> object:
+            return self._copy_typed_value(value, element_type)
+
+        def index_at(position: int) -> int | None:
+            value = arguments[position]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise AetherRuntimeError(
+                    f"{name} index must be an integer at line {expression.span.line}"
+                )
+            if value < 0 or value >= len(list_value):
+                return None
+            return value
+
+        if name == "get":
+            index = index_at(1)
+            if index is None:
+                return ResultValue.err(int(CollectionErrorCode.OUT_OF_RANGE))
+            try:
+                return ResultValue.ok(clone_element(list_value[index]))
+            except (MemoryError, OverflowError):
+                return ResultValue.err(
+                    int(CollectionErrorCode.ALLOCATION_FAILURE)
+                )
+        if name == "slice":
+            start, end = arguments[1], arguments[2]
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+            ):
+                raise AetherRuntimeError(
+                    f"slice bounds must be integers at line {expression.span.line}"
+                )
+            if start < 0 or end < start or end > len(list_value):
+                return ResultValue.err(int(CollectionErrorCode.OUT_OF_RANGE))
+            try:
+                return ResultValue.ok(
+                    [clone_element(value) for value in list_value[start:end]]
+                )
+            except (MemoryError, OverflowError):
+                return ResultValue.err(
+                    int(CollectionErrorCode.ALLOCATION_FAILURE)
+                )
+        if name == "set":
+            index = index_at(1)
+            if index is None:
+                return ResultValue.err(int(CollectionErrorCode.OUT_OF_RANGE))
+            try:
+                value = clone_element(arguments[2])
+                if isinstance(collection, _CowList):
+                    list_value = collection.make_unique(clone_element)
+                list_value[index] = value
+            except (MemoryError, OverflowError):
+                return ResultValue.err(
+                    int(CollectionErrorCode.ALLOCATION_FAILURE)
+                )
+            return ResultValue.ok(None)
+        if name == "append":
+            try:
+                value = clone_element(arguments[1])
+                if isinstance(collection, _CowList):
+                    list_value = collection.make_unique(clone_element)
+                list_value.append(value)
+            except (MemoryError, OverflowError):
+                return ResultValue.err(
+                    int(CollectionErrorCode.ALLOCATION_FAILURE)
+                )
+            return ResultValue.ok(None)
+        if name == "pop":
+            if not list_value:
+                return ResultValue.err(int(CollectionErrorCode.EMPTY))
+            try:
+                if isinstance(collection, _CowList):
+                    list_value = collection.make_unique(clone_element)
+                value = clone_element(list_value[-1])
+                list_value.pop()
+                return ResultValue.ok(value)
+            except (MemoryError, OverflowError):
+                return ResultValue.err(
+                    int(CollectionErrorCode.ALLOCATION_FAILURE)
+                )
+        if name == "insert":
+            index = arguments[1]
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise AetherRuntimeError(
+                    f"insert index must be an integer at line {expression.span.line}"
+                )
+            if index < 0 or index > len(list_value):
+                return ResultValue.err(int(CollectionErrorCode.OUT_OF_RANGE))
+            try:
+                value = clone_element(arguments[2])
+                if isinstance(collection, _CowList):
+                    list_value = collection.make_unique(clone_element)
+                list_value.insert(index, value)
+            except (MemoryError, OverflowError):
+                return ResultValue.err(
+                    int(CollectionErrorCode.ALLOCATION_FAILURE)
+                )
+            return ResultValue.ok(None)
+        index = index_at(1)
+        if index is None:
+            return ResultValue.err(int(CollectionErrorCode.OUT_OF_RANGE))
+        try:
+            if isinstance(collection, _CowList):
+                list_value = collection.make_unique(clone_element)
+            value = clone_element(list_value[index])
+            list_value.pop(index)
+        except (MemoryError, OverflowError):
+            return ResultValue.err(int(CollectionErrorCode.ALLOCATION_FAILURE))
+        return ResultValue.ok(value)
+
+    def _run_host_io(
+        self,
+        name: str,
+        arguments: list[object],
+    ) -> ResultValue:
+        if name == "io_write":
+            try:
+                data = str(arguments[0]).encode("utf-8", errors="strict")
+                self.stdout.write(data)
+                self.stdout.flush()
+            except (UnicodeEncodeError, OSError, ValueError):
+                return ResultValue.err(int(IoErrorCode.IO_FAILURE))
+            return ResultValue.ok(None)
+        if name == "io_read_line":
+            data = bytearray()
+            try:
+                while True:
+                    byte = self.stdin.read(1)
+                    if not byte:
+                        if not data:
+                            return ResultValue.err(int(IoErrorCode.END_OF_INPUT))
+                        break
+                    if isinstance(byte, str):
+                        byte = byte.encode("utf-8", errors="strict")
+                    if byte == b"\n":
+                        break
+                    data.extend(byte)
+            except UnicodeEncodeError:
+                return ResultValue.err(int(IoErrorCode.INVALID_UTF8))
+            except (OSError, ValueError):
+                return ResultValue.err(int(IoErrorCode.IO_FAILURE))
+            if data.endswith(b"\r"):
+                data.pop()
+            try:
+                return ResultValue.ok(data.decode("utf-8", errors="strict"))
+            except UnicodeDecodeError:
+                return ResultValue.err(int(IoErrorCode.INVALID_UTF8))
+
+        if name == "fs_exists":
+            try:
+                resolve_project_path(self.project_root, str(arguments[0]))
+            except ProjectPathNotFound:
+                return ResultValue.ok(False)
+            except ProjectPathError:
+                return ResultValue.err(int(FsErrorCode.INVALID_PATH))
+            except OSError:
+                return ResultValue.err(int(FsErrorCode.IO_FAILURE))
+            return ResultValue.ok(True)
+
+        try:
+            path = resolve_project_path(
+                self.project_root,
+                str(arguments[0]),
+                for_write=name == "fs_write_text",
+            )
+        except ProjectPathNotFound:
+            return ResultValue.err(int(FsErrorCode.NOT_FOUND))
+        except ProjectPathError:
+            return ResultValue.err(int(FsErrorCode.INVALID_PATH))
+        except OSError:
+            return ResultValue.err(int(FsErrorCode.IO_FAILURE))
+
+        if name == "fs_read_text":
+            try:
+                return ResultValue.ok(path.read_bytes().decode("utf-8", errors="strict"))
+            except FileNotFoundError:
+                return ResultValue.err(int(FsErrorCode.NOT_FOUND))
+            except UnicodeDecodeError:
+                return ResultValue.err(int(FsErrorCode.INVALID_UTF8))
+            except OSError:
+                return ResultValue.err(int(FsErrorCode.IO_FAILURE))
+
+        try:
+            content = str(arguments[1]).encode("utf-8", errors="strict")
+            path.write_bytes(content)
+        except UnicodeEncodeError:
+            return ResultValue.err(int(FsErrorCode.INVALID_UTF8))
+        except FileNotFoundError:
+            return ResultValue.err(int(FsErrorCode.NOT_FOUND))
+        except OSError:
+            return ResultValue.err(int(FsErrorCode.IO_FAILURE))
+        return ResultValue.ok(None)
 
     def _pure_builtin(
         self,
@@ -1251,6 +1901,8 @@ class Interpreter:
             return self._wrap(result, expression.type)
         if name == "len" and len(raw) == 1:
             try:
+                if isinstance(raw[0], _CowList):
+                    return len(raw[0].values)
                 return len(raw[0])
             except TypeError as error:
                 raise AetherRuntimeError(
@@ -1293,6 +1945,27 @@ class Interpreter:
     ) -> object:
         left_raw = left.value if isinstance(left, Quantity) else left
         right_raw = right.value if isinstance(right, Quantity) else right
+        if operator in {"<<", ">>"}:
+            width = (
+                64
+                if expression.type.name == "usize"
+                else int(expression.type.name[1:])
+            )
+            if int(right_raw) < 0 or int(right_raw) >= width:
+                raise AetherRuntimeError(
+                    f"Invalid shift count at line {expression.span.line}"
+                )
+            if operator == "<<":
+                mask = (1 << width) - 1
+                shifted = (int(left_raw) << int(right_raw)) & mask
+                if expression.type.name.startswith("i") and shifted & (1 << (width - 1)):
+                    shifted -= 1 << width
+                return self._wrap(shifted, expression.type)
+            if expression.type.name.startswith("u"):
+                return self._wrap(
+                    int(left_raw) >> int(right_raw),
+                    expression.type,
+                )
         operation: dict[str, Callable[[object, object], object]] = {
             "+": lambda a, b: a + b,
             "-": lambda a, b: a - b,
@@ -1300,6 +1973,11 @@ class Interpreter:
             "/": _divide,
             "%": _remainder,
             "**": lambda a, b: a**b,
+            "&": lambda a, b: a & b,
+            "|": lambda a, b: a | b,
+            "^": lambda a, b: a ^ b,
+            "<<": lambda a, b: a << b,
+            ">>": lambda a, b: a >> b,
             "==": lambda a, b: a == b,
             "!=": lambda a, b: a != b,
             "<": lambda a, b: a < b,
@@ -1365,7 +2043,10 @@ class Interpreter:
                 content,
             )
         try:
-            return int(value)
+            return int(
+                value.replace("_", ""),
+                0 if value.lower().startswith(("0x", "0b")) else 10,
+            )
         except ValueError:
             try:
                 return float(value)

@@ -11,11 +11,18 @@ from src.ai_view import (
     AIView,
     ProfileError,
     default_profile,
+    expand_ai_view,
     generate_ai_view_with_map,
     load_profiles,
 )
 from src.codemap import build_codemap, render_active_slice, render_map
-from src.frontend import Diagnostic, FrontendResult, SourceSpan, parse_source
+from src.frontend import (
+    Diagnostic,
+    FrontendResult,
+    SourceSpan,
+    parse_source,
+    render_module,
+)
 from src.parser import CSTNode, ParseError
 
 
@@ -157,6 +164,28 @@ def _nearest_mapping(view: AIView, offset: int):
             abs(offset - mapping.view_end),
         ),
     )
+
+
+def _apply_text_edits(text: str, edits: list) -> str:
+    resolved: list[tuple[int, int, str]] = []
+    for edit in edits:
+        if not isinstance(edit, dict) or not isinstance(edit.get("newText"), str):
+            raise ValueError("Each AI-view edit must contain newText")
+        range_value = edit.get("range")
+        if not isinstance(range_value, dict):
+            raise InvalidPosition("Each AI-view edit requires a range")
+        start = _offset_at_position(text, _position_dict(range_value.get("start")))
+        end = _offset_at_position(text, _position_dict(range_value.get("end")))
+        if end < start:
+            raise InvalidPosition("AI-view edit range end precedes start")
+        resolved.append((start, end, edit["newText"]))
+    resolved.sort(key=lambda item: (item[0], item[1]))
+    for previous, current in zip(resolved, resolved[1:]):
+        if current[0] < previous[1] or current[0] == previous[0]:
+            raise InvalidPosition("AI-view edit ranges overlap or are ambiguous")
+    for start, end, replacement in reversed(resolved):
+        text = text[:start] + replacement + text[end:]
+    return text
 
 
 class AetherLanguageServer:
@@ -379,6 +408,113 @@ class AetherLanguageServer:
             "kind": mapping.kind,
         }
 
+    def _apply_ai_view_edits(self, params: dict) -> dict:
+        item = params.get("textDocument")
+        if not isinstance(item, dict) or not isinstance(item.get("uri"), str):
+            raise ValueError("aether/applyAIViewEdits requires textDocument.uri")
+        uri = item["uri"]
+        document = self._document(uri)
+        source_version = params.get("version")
+        target_version = params.get("newVersion")
+        if (
+            not isinstance(source_version, int)
+            or isinstance(source_version, bool)
+            or not isinstance(target_version, int)
+            or isinstance(target_version, bool)
+        ):
+            raise ValueError(
+                "aether/applyAIViewEdits requires integer version and newVersion"
+            )
+        if source_version != document.version:
+            raise ValueError(
+                f"Stale AI-view edit: expected source version {document.version}, "
+                f"received {source_version}"
+            )
+        if target_version <= source_version:
+            raise ValueError("newVersion must be greater than the source version")
+        profile_name = params.get("profile", default_profile().name)
+        if not isinstance(profile_name, str):
+            raise ValueError("profile must be a string")
+        edits = params.get("edits")
+        if not isinstance(edits, list) or not edits:
+            raise ValueError("aether/applyAIViewEdits requires non-empty edits")
+
+        profile = self.profiles.get(profile_name)
+        if profile is None:
+            raise KeyError(f"Unknown tokenizer profile {profile_name!r}")
+        current_view = self._view(document, profile_name)
+        edited_view = _apply_text_edits(current_view.text, edits)
+        expanded_source = expand_ai_view(edited_view, profile)
+        analysis = parse_source(expanded_source)
+        candidate = _Document(uri, expanded_source, target_version)
+        diagnostics = [
+            _diagnostic_to_lsp(expanded_source, diagnostic)
+            for diagnostic in analysis.diagnostics
+        ]
+        if any(diagnostic.severity == "error" for diagnostic in analysis.diagnostics):
+            return {
+                "accepted": False,
+                "uri": uri,
+                "sourceVersion": source_version,
+                "version": target_version,
+                "diagnostics": diagnostics,
+            }
+
+        candidate_source = render_module(analysis.ast)
+        candidate = _Document(uri, candidate_source, target_version)
+        candidate_view = self._view(candidate, profile_name)
+        candidate_map = self._map_text(candidate)
+        mappings = [
+            {
+                "sourceRange": _range_at_offsets(
+                    candidate_source,
+                    mapping.source_start,
+                    mapping.source_end,
+                ),
+                "viewRange": _range_at_offsets(
+                    candidate_view.text,
+                    mapping.view_start,
+                    mapping.view_end,
+                ),
+                "kind": mapping.kind,
+            }
+            for mapping in candidate_view.mappings
+        ]
+        return {
+            "accepted": True,
+            "uri": uri,
+            "sourceVersion": source_version,
+            "version": target_version,
+            "source": candidate_source,
+            "ai": candidate_view.text,
+            "map": candidate_map,
+            "diagnostics": [
+                _diagnostic_to_lsp(candidate_source, diagnostic)
+                for diagnostic in self._analysis(candidate).diagnostics
+            ],
+            "mappings": mappings,
+            "workspaceEdit": {
+                "documentChanges": [
+                    {
+                        "textDocument": {
+                            "uri": uri,
+                            "version": source_version,
+                        },
+                        "edits": [
+                            {
+                                "range": _range_at_offsets(
+                                    document.text,
+                                    0,
+                                    len(document.text),
+                                ),
+                                "newText": candidate_source,
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
     @staticmethod
     def _error(request_id, code: int, message: str) -> dict:
         return {
@@ -475,6 +611,8 @@ class AetherLanguageServer:
                 result = self._source_position(params)
             elif method == "aether/viewPosition":
                 result = self._view_position(params)
+            elif method == "aether/applyAIViewEdits":
+                result = self._apply_ai_view_edits(params)
             elif request_id is not None:
                 return self._error(request_id, -32601, f"Method not found: {method}")
             else:

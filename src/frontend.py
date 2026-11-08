@@ -21,24 +21,30 @@ _BINARY_PRECEDENCE = {
     "??": 2,
     "||": 3,
     "&&": 4,
-    "==": 5,
-    "!=": 5,
-    "<": 5,
-    ">": 5,
-    "<=": 5,
-    ">=": 5,
-    "+": 6,
-    "-": 6,
-    "*": 7,
-    "/": 7,
-    "%": 7,
-    "**": 8,
+    "|": 5,
+    "^": 6,
+    "&": 7,
+    "==": 8,
+    "!=": 8,
+    "<": 8,
+    ">": 8,
+    "<=": 8,
+    ">=": 8,
+    "<<": 9,
+    ">>": 9,
+    "+": 10,
+    "-": 10,
+    "*": 11,
+    "/": 11,
+    "%": 11,
+    "**": 12,
 }
 _BUILTIN_CALLS = {
     "mean", "max_abs", "subtract", "scale", "abs", "min", "max", "sum", "len",
     "convert", "io_write", "io_read_line", "fs_read_text", "fs_write_text",
     "fs_exists", "net_get", "net_post", "gradient", "frame_buffer",
-    "frame_buffer_len", "Ok", "Err",
+    "frame_buffer_len", "args_len", "args_get", "Ok", "Err",
+    "List", "get", "set", "slice", "append", "pop", "insert", "remove",
 }
 _KNOWN_ATTRIBUTES = {
     "pure", "io", "net", "fs", "ffi", "link", "persist", "contract", "C", "target",
@@ -48,8 +54,9 @@ _BUILTIN_TYPES = {
     "i8", "i16", "i32", "i64", "i128",
     "u8", "u16", "u32", "u64", "u128",
     "f16", "bf16", "f32", "f64", "fp8", "i4", "t2",
-    "Tensor", "Slice", "Pool", "Id", "Result",
-    "IoError", "FsError", "NetError", "FrameBuffer",
+    "Tensor", "Array", "List", "Slice", "SliceMut", "Pool", "Id", "Result",
+    "IoError", "FsError", "NetError", "ArgsError", "CollectionError",
+    "FrameBuffer",
 }
 _UNIT_NAMES = {
     "mm", "cm", "m", "km", "um", "nm", "V", "mV", "uV", "A", "mA",
@@ -135,6 +142,7 @@ class Expr:
     value: str = ""
     children: tuple[Expr, ...] = ()
     arms: tuple[MatchArm, ...] = ()
+    field_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -151,6 +159,8 @@ class AssignmentStmt:
     name: str
     value: Expr
     span: SourceSpan
+    operator: str = "="
+    field_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,7 +175,46 @@ class ExprStmt:
     span: SourceSpan
 
 
-Statement = LetStmt | AssignmentStmt | ReturnStmt | ExprStmt
+@dataclass(frozen=True)
+class IfStmt:
+    condition: Expr
+    body: tuple[Statement, ...]
+    else_body: tuple[Statement, ...]
+    span: SourceSpan
+
+
+@dataclass(frozen=True)
+class WhileStmt:
+    condition: Expr
+    body: tuple[Statement, ...]
+    span: SourceSpan
+
+
+@dataclass(frozen=True)
+class ForStmt:
+    name: str
+    start: Expr
+    end: Expr
+    body: tuple[Statement, ...]
+    span: SourceSpan
+
+
+@dataclass(frozen=True)
+class LoopControlStmt:
+    kind: str
+    span: SourceSpan
+
+
+Statement = (
+    LetStmt
+    | AssignmentStmt
+    | ReturnStmt
+    | ExprStmt
+    | IfStmt
+    | WhileStmt
+    | ForStmt
+    | LoopControlStmt
+)
 
 
 @dataclass(frozen=True)
@@ -178,6 +227,7 @@ class FunctionDecl:
     span: SourceSpan
     external_abi: str | None = None
     external_library: str | None = None
+    external_symbol: str | None = None
 
 
 @dataclass(frozen=True)
@@ -438,6 +488,7 @@ class _FrontendParser:
             self.span(attributes[0].span.start if attributes else start, end),
             external_abi,
             external_library,
+            name_token.value if external_abi is not None else None,
         )
 
     def parse_type_decl(self, attributes: tuple[Attribute, ...]) -> TypeDecl:
@@ -489,11 +540,14 @@ class _FrontendParser:
         unit_expression = None
         end = name.end
         if self.match("<"):
-            if name.value == "Tensor":
+            if name.value in {"Tensor", "Array"}:
                 arguments.append(self.parse_type())
-                self.expect(",", "Tensor type requires an element type and shape")
+                self.expect(
+                    ",",
+                    f"{name.value} type requires an element type and shape",
+                )
                 arguments.append(self.parse_type())
-                if self.match(","):
+                if name.value == "Tensor" and self.match(","):
                     unit_expression = self.parse_unit_expression()
             elif name.value in {
                 "f16", "bf16", "f32", "f64", "fp8",
@@ -609,18 +663,79 @@ class _FrontendParser:
 
     def parse_statement(self) -> Statement:
         token = self.current()
+        if token.value == "if":
+            start = self.advance()
+            condition = self.parse_expression()
+            body, end = self.parse_block()
+            else_body: tuple[Statement, ...] = ()
+            if self.match("else"):
+                if self.current().value == "if":
+                    nested = self.parse_statement()
+                    else_body = (nested,)
+                    end = nested.span.end
+                else:
+                    else_body, end = self.parse_block()
+            return IfStmt(condition, body, else_body, self.span(start.start, end))
+        if token.value == "while":
+            start = self.advance()
+            condition = self.parse_expression()
+            body, end = self.parse_block()
+            return WhileStmt(condition, body, self.span(start.start, end))
+        if token.value == "for":
+            start = self.advance()
+            name = self.expect_identifier("Expected a loop variable after 'for'")
+            self.expect("in", "Expected 'in' after loop variable")
+            range_start = self.parse_expression()
+            self.expect("..", "Expected a half-open 'start..end' range")
+            range_end = self.parse_expression()
+            body, end = self.parse_block()
+            return ForStmt(
+                name.value,
+                range_start,
+                range_end,
+                body,
+                self.span(start.start, end),
+            )
+        if token.value in {"break", "continue"}:
+            control = self.advance()
+            return LoopControlStmt(
+                control.value,
+                self.span(control.start, control.end),
+            )
         if (
             token.kind == "IDENTIFIER"
             and self.position + 1 < len(self.tokens)
-            and self.tokens[self.position + 1].value == "="
+            and self.tokens[self.position + 1].value in {
+                "=", "+=", "-=", "*=", "/="
+            }
         ):
             name = self.advance()
-            self.advance()
+            operator = self.advance().value
             value = self.parse_expression()
             return AssignmentStmt(
                 name.value,
                 value,
                 self.span(name.start, value.span.end),
+                operator,
+            )
+        if (
+            token.kind == "IDENTIFIER"
+            and self.position + 3 < len(self.tokens)
+            and self.tokens[self.position + 1].value == "."
+            and self.tokens[self.position + 2].kind == "IDENTIFIER"
+            and self.tokens[self.position + 3].value == "="
+        ):
+            target = self.advance()
+            self.advance()
+            field = self.advance()
+            self.advance()
+            value = self.parse_expression()
+            return AssignmentStmt(
+                target.value,
+                value,
+                self.span(target.start, value.span.end),
+                "=",
+                field.value,
             )
         if token.value in {"let", "var", "const"}:
             start = self.advance()
@@ -653,6 +768,34 @@ class _FrontendParser:
         left = self.parse_prefix()
         while True:
             token = self.current()
+            if (
+                token.value == "{"
+                and left.kind in {"identifier", "qualified"}
+                and self.position + 2 < len(self.tokens)
+                and self.tokens[self.position + 1].kind == "IDENTIFIER"
+                and self.tokens[self.position + 2].value == ":"
+            ):
+                self.advance()
+                field_names: list[str] = []
+                field_values: list[Expr] = []
+                while self.current().value not in {"}", ""}:
+                    field = self.expect_identifier(
+                        "Expected a field name in struct initializer"
+                    )
+                    self.expect(":", "Expected ':' after struct initializer field")
+                    field_values.append(self.parse_expression())
+                    field_names.append(field.value)
+                    if not self.match(","):
+                        break
+                end = self.expect("}", "Expected '}' after struct initializer").end
+                left = Expr(
+                    "struct_literal",
+                    self.span(left.span.start, end),
+                    left.value,
+                    tuple(field_values),
+                    field_names=tuple(field_names),
+                )
+                continue
             if token.value == "?":
                 end = self.advance().end
                 left = Expr("try", self.span(left.span.start, end), children=(left,))
@@ -706,11 +849,24 @@ class _FrontendParser:
 
     def parse_prefix(self) -> Expr:
         token = self.current()
+        if token.value == "[":
+            start = self.advance()
+            elements: list[Expr] = []
+            while self.current().value not in {"]", ""}:
+                elements.append(self.parse_expression())
+                if not self.match(","):
+                    break
+            end = self.expect("]", "Expected ']' after collection literal").end
+            return Expr(
+                "array_literal",
+                self.span(start.start, end),
+                children=tuple(elements),
+            )
         if token.value == "match":
             return self.parse_match_expression()
-        if token.value in {"!", "-", "+"}:
+        if token.value in {"!", "-", "+", "~"}:
             operator = self.advance()
-            value = self.parse_expression(9)
+            value = self.parse_expression(13)
             return Expr("unary", self.span(operator.start, value.span.end), operator.value, (value,))
         if token.value == "(":
             start = self.advance()
@@ -821,6 +977,7 @@ def _analyze(module: Module, parser: _FrontendParser) -> None:
     declarations: dict[str, Declaration] = {}
     functions = {declaration.name for declaration in module.declarations if isinstance(declaration, FunctionDecl)}
     type_names = {declaration.name for declaration in module.declarations if isinstance(declaration, TypeDecl)}
+    target_attributes: list[Attribute] = []
     for declaration in module.declarations:
         if declaration.name in declarations:
             parser.diagnostics.append(
@@ -847,6 +1004,31 @@ def _analyze(module: Module, parser: _FrontendParser) -> None:
                     )
                 )
             seen_attributes.add(attribute.name)
+            if attribute.name == "C" and (
+                not isinstance(declaration, FunctionDecl)
+                or declaration.external_abi is not None
+                or attribute.arguments
+            ):
+                parser.diagnostics.append(
+                    Diagnostic(
+                        "E_C_ATTRIBUTE",
+                        "@C is supported without arguments on Aether-defined functions",
+                        attribute.span,
+                    )
+                )
+            if attribute.name == "target":
+                target_attributes.append(attribute)
+                if (
+                    not isinstance(declaration, FunctionDecl)
+                    or attribute.arguments != ("mcu",)
+                ):
+                    parser.diagnostics.append(
+                        Diagnostic(
+                            "E_TARGET_ATTRIBUTE",
+                            "@target is currently supported only as @target(mcu) on a function",
+                            attribute.span,
+                        )
+                    )
         if "pure" in seen_attributes and seen_attributes & {"io", "net", "fs", "ffi"}:
             parser.diagnostics.append(
                 Diagnostic(
@@ -910,6 +1092,15 @@ def _analyze(module: Module, parser: _FrontendParser) -> None:
                     declaration.span,
                 )
             )
+    if len(target_attributes) > 1:
+        for attribute in target_attributes[1:]:
+            parser.diagnostics.append(
+                Diagnostic(
+                    "E_TARGET_ATTRIBUTE",
+                    "A module may declare @target(mcu) only once",
+                    attribute.span,
+                )
+            )
 
     for declaration in module.declarations:
         if isinstance(declaration, TypeDecl):
@@ -940,30 +1131,80 @@ def _analyze(module: Module, parser: _FrontendParser) -> None:
                 )
             locals_.add(parameter.name)
 
-        for statement in declaration.body:
-            if isinstance(statement, (LetStmt, AssignmentStmt, ReturnStmt)):
-                expression = statement.value
-            else:
-                expression = statement.expression
-            if expression is not None:
-                _analyze_expression(
-                    expression,
-                    locals_,
-                    functions,
-                    parser.diagnostics,
-                )
-            if isinstance(statement, LetStmt):
-                if statement.annotation is not None:
-                    _analyze_type(statement.annotation, type_names, parser.diagnostics)
-                if statement.name in locals_:
-                    parser.diagnostics.append(
-                        Diagnostic(
-                            "E_DUPLICATE_BINDING",
-                            f"Duplicate local binding {statement.name!r}",
-                            statement.span,
-                        )
+        def analyze_block(
+            statements: tuple[Statement, ...],
+            scope: set[str],
+        ) -> None:
+            for statement in statements:
+                if isinstance(statement, (IfStmt, WhileStmt)):
+                    _analyze_expression(
+                        statement.condition,
+                        scope,
+                        functions,
+                        parser.diagnostics,
                     )
-                locals_.add(statement.name)
+                    if isinstance(statement, IfStmt):
+                        analyze_block(statement.body, set(scope))
+                        analyze_block(statement.else_body, set(scope))
+                    else:
+                        analyze_block(statement.body, set(scope))
+                    continue
+                if isinstance(statement, ForStmt):
+                    _analyze_expression(
+                        statement.start,
+                        scope,
+                        functions,
+                        parser.diagnostics,
+                    )
+                    _analyze_expression(
+                        statement.end,
+                        scope,
+                        functions,
+                        parser.diagnostics,
+                    )
+                    loop_scope = set(scope)
+                    if statement.name in loop_scope:
+                        parser.diagnostics.append(
+                            Diagnostic(
+                                "E_DUPLICATE_BINDING",
+                                f"Loop variable {statement.name!r} shadows an existing binding",
+                                statement.span,
+                            )
+                        )
+                    loop_scope.add(statement.name)
+                    analyze_block(statement.body, loop_scope)
+                    continue
+                if isinstance(statement, LoopControlStmt):
+                    continue
+                if isinstance(statement, (LetStmt, AssignmentStmt, ReturnStmt)):
+                    expression = statement.value
+                else:
+                    expression = statement.expression
+                if expression is not None:
+                    _analyze_expression(
+                        expression,
+                        scope,
+                        functions,
+                        parser.diagnostics,
+                    )
+                if isinstance(statement, LetStmt):
+                    if statement.annotation is not None:
+                        _analyze_type(
+                            statement.annotation,
+                            type_names,
+                            parser.diagnostics,
+                        )
+                    if statement.name in scope:
+                        parser.diagnostics.append(
+                            Diagnostic(
+                                "E_DUPLICATE_BINDING",
+                                f"Duplicate local binding {statement.name!r}",
+                                statement.span,
+                            )
+                        )
+                    scope.add(statement.name)
+
+        analyze_block(declaration.body, locals_)
 
 
 def _analyze_type(
@@ -1052,7 +1293,8 @@ def _analyze_expression(
                 and callee.value == "Err"
                 and index == 0
                 and argument.kind == "identifier"
-                and argument.value in {"IoError", "FsError", "NetError"}
+                and argument.value
+                in {"IoError", "FsError", "NetError", "ArgsError"}
             )
             if not is_error_marker:
                 _analyze_expression(argument, locals_, functions, diagnostics)
@@ -1153,6 +1395,15 @@ def _render_expression(expression: Expr, parent_precedence: int = 0) -> str:
             + expression.value
             + _render_expression(expression.children[1])
         )
+    if expression.kind == "struct_literal":
+        return expression.value + " { " + ", ".join(
+            f"{name}: {_render_expression(value)}"
+            for name, value in zip(expression.field_names, expression.children)
+        ) + " }"
+    if expression.kind == "array_literal":
+        return "[" + ", ".join(
+            _render_expression(value) for value in expression.children
+        ) + "]"
     if expression.kind == "index":
         return (
             _render_expression(expression.children[0], 10)
@@ -1180,6 +1431,71 @@ def _render_expression(expression: Expr, parent_precedence: int = 0) -> str:
 
 def _escape_import_path(path: str) -> str:
     return path.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _render_statements(statements: tuple[Statement, ...], indentation: int) -> list[str]:
+    prefix = " " * indentation
+    lines: list[str] = []
+    for statement in statements:
+        if isinstance(statement, IfStmt):
+            lines.append(
+                prefix + "if " + _render_expression(statement.condition) + " {"
+            )
+            lines.extend(_render_statements(statement.body, indentation + 4))
+            if statement.else_body:
+                lines.append(prefix + "} else {")
+                lines.extend(_render_statements(statement.else_body, indentation + 4))
+            lines.append(prefix + "}")
+        elif isinstance(statement, WhileStmt):
+            lines.append(
+                prefix + "while " + _render_expression(statement.condition) + " {"
+            )
+            lines.extend(_render_statements(statement.body, indentation + 4))
+            lines.append(prefix + "}")
+        elif isinstance(statement, ForStmt):
+            lines.append(
+                prefix + f"for {statement.name} in "
+                + _render_expression(statement.start)
+                + ".."
+                + _render_expression(statement.end)
+                + " {"
+            )
+            lines.extend(_render_statements(statement.body, indentation + 4))
+            lines.append(prefix + "}")
+        elif isinstance(statement, LoopControlStmt):
+            lines.append(prefix + statement.kind + ";")
+        elif isinstance(statement, LetStmt):
+            annotation = (
+                f": {_render_type(statement.annotation)}"
+                if statement.annotation
+                else ""
+            )
+            lines.append(
+                prefix
+                + f"{statement.binding_kind} {statement.name}{annotation} = "
+                + _render_expression(statement.value)
+                + ";"
+            )
+        elif isinstance(statement, AssignmentStmt):
+            target = (
+                f"{statement.name}.{statement.field_name}"
+                if statement.field_name is not None
+                else statement.name
+            )
+            lines.append(
+                prefix
+                + f"{target} {statement.operator} "
+                + _render_expression(statement.value)
+                + ";"
+            )
+        elif isinstance(statement, ReturnStmt):
+            rendered = "return"
+            if statement.value is not None:
+                rendered += " " + _render_expression(statement.value)
+            lines.append(prefix + rendered + ";")
+        else:
+            lines.append(prefix + _render_expression(statement.expression) + ";")
+    return lines
 
 
 def render_module(module: Module) -> str:
@@ -1222,29 +1538,7 @@ def render_module(module: Module) -> str:
             )
             continue
         lines.append(f"fn {declaration.name}({parameters}){return_type} {{")
-        for statement in declaration.body:
-            if isinstance(statement, LetStmt):
-                annotation = (
-                    f": {_render_type(statement.annotation)}"
-                    if statement.annotation
-                    else ""
-                )
-                rendered = (
-                    f"{statement.binding_kind} {statement.name}{annotation} = "
-                    f"{_render_expression(statement.value)};"
-                )
-            elif isinstance(statement, AssignmentStmt):
-                rendered = (
-                    f"{statement.name} = {_render_expression(statement.value)};"
-                )
-            elif isinstance(statement, ReturnStmt):
-                rendered = "return"
-                if statement.value is not None:
-                    rendered += " " + _render_expression(statement.value)
-                rendered += ";"
-            else:
-                rendered = _render_expression(statement.expression) + ";"
-            lines.append("    " + rendered)
+        lines.extend(_render_statements(declaration.body, 4))
         lines.append("}")
     return "\n".join(lines) + ("\n" if lines else "")
 

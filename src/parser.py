@@ -23,6 +23,8 @@ _KEYWORDS = {
     "for",
     "while",
     "match",
+    "break",
+    "continue",
     "true",
     "false",
     "none",
@@ -41,6 +43,8 @@ _OPERATORS = (
     "!=",
     "<=",
     ">=",
+    "<<",
+    ">>",
     "&&",
     "||",
     "+=",
@@ -51,7 +55,16 @@ _OPERATORS = (
     "..",
     "∇",
 )
-_NUMBER_RE = re.compile(r"(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?")
+_NUMBER_RE = re.compile(
+    r"(?:"
+    r"0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*"
+    r"|0[bB][01](?:_?[01])*"
+    r"|\d+\.(?!\.)\d*"
+    r"|\d+\.(?!\.)"
+    r"|\.\d+"
+    r"|\d+"
+    r")(?:[eE][+-]?\d+)?"
+)
 
 
 class ParseError(ValueError):

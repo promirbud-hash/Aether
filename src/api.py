@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path, PureWindowsPath
 import tempfile
-from typing import Mapping, Sequence
+from typing import BinaryIO, Mapping, Sequence
 
 from src.build import (
     C99LinkConfigurationError,
@@ -19,7 +19,12 @@ from src.build import (
     link_c99_objects,
     link_c99_executable_sources,
 )
-from src.c99 import C99LoweringError, emit_c99_module, emit_c99_module_units
+from src.c99 import (
+    C99LoweringError,
+    emit_c99_module,
+    emit_c99_module_header,
+    emit_c99_module_units,
+)
 from src.frontend import Diagnostic, SourceSpan, parse_source
 from src.interpreter import (
     EffectHandler,
@@ -146,6 +151,31 @@ def emit_c99_project(entry_path: str | os.PathLike[str]) -> str:
         return emit_c99_module(module)
     except C99LoweringError as error:
         raise CompilationError(error.diagnostics) from error
+
+
+def emit_c99_header(source: str) -> str:
+    """Compile source and emit declarations for its @C exports."""
+    module = compile_source(source)
+    try:
+        return emit_c99_module_header(module)
+    except C99LoweringError as error:
+        raise CompilationError(error.diagnostics) from error
+
+
+def emit_c99_project_header(entry_path: str | os.PathLike[str]) -> str:
+    """Compile a project and emit declarations for all @C exports."""
+    module = compile_project(entry_path)
+    try:
+        return emit_c99_module_header(module)
+    except C99LoweringError as error:
+        raise CompilationError(error.diagnostics) from error
+
+
+def write_c99_header(source: str, output_path: str | os.PathLike[str]) -> Path:
+    """Write the header for source @C exports and return its path."""
+    path = Path(output_path)
+    path.write_text(emit_c99_header(source), encoding="utf-8", newline="\n")
+    return path
 
 
 def build_object(
@@ -582,15 +612,23 @@ def run_source(
     effect_handlers: Mapping[str, EffectHandler] | None = None,
     external_handlers: Mapping[str, ExternalFunctionHandler] | None = None,
     max_call_depth: int = 128,
+    stdin: BinaryIO | None = None,
+    stdout: BinaryIO | None = None,
+    project_root: str | os.PathLike[str] | None = None,
+    program_args: Sequence[str] = (),
     **keywords: object,
 ) -> object:
-    """Compile source and invoke one function with explicit effect handlers."""
+    """Compile and invoke a function with injectable host-runtime services."""
     module = compile_source(source)
     interpreter = Interpreter(
         module,
         effect_handlers=effect_handlers,
         external_handlers=external_handlers,
         max_call_depth=max_call_depth,
+        stdin=stdin,
+        stdout=stdout,
+        project_root=project_root,
+        program_args=tuple(program_args),
     )
     return interpreter.run(function_name, *arguments, **keywords)
 
@@ -602,14 +640,21 @@ def run_project(
     effect_handlers: Mapping[str, EffectHandler] | None = None,
     external_handlers: Mapping[str, ExternalFunctionHandler] | None = None,
     max_call_depth: int = 128,
+    stdin: BinaryIO | None = None,
+    stdout: BinaryIO | None = None,
+    program_args: Sequence[str] = (),
     **keywords: object,
 ) -> object:
-    """Compile a project and invoke a function from its entry module."""
+    """Run a project with its entry directory as the filesystem root."""
     module = compile_project(entry_path)
     interpreter = Interpreter(
         module,
         effect_handlers=effect_handlers,
         external_handlers=external_handlers,
         max_call_depth=max_call_depth,
+        stdin=stdin,
+        stdout=stdout,
+        project_root=Path(entry_path).expanduser().resolve().parent,
+        program_args=tuple(program_args),
     )
     return interpreter.run(function_name, *arguments, **keywords)
